@@ -19,7 +19,7 @@ def test_default_config_loading(monkeypatch, tmp_path):
 
     assert cfg.bot_token == ""
     assert cfg.allowed_users == set()
-    assert cfg.audio_bitrate == 192
+    assert cfg.audio_bitrate == 320
     assert cfg.max_file_size_mb == 50
     assert cfg.max_file_size_bytes == 50 * 1024 * 1024
     assert cfg.download_dir.exists()
@@ -32,7 +32,7 @@ def test_custom_config_values(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test_token_123456")
     monkeypatch.setenv("ALLOWED_USERS", "111111, 222222, invalid, 333333")
     monkeypatch.setenv("DOWNLOAD_DIR", str(test_dir))
-    monkeypatch.setenv("AUDIO_BITRATE", "320")
+    monkeypatch.setenv("AUDIO_BITRATE", "256")
     monkeypatch.setenv("MAX_FILE_SIZE_MB", "45")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
 
@@ -40,7 +40,7 @@ def test_custom_config_values(monkeypatch, tmp_path):
 
     assert cfg.bot_token == "test_token_123456"
     assert cfg.allowed_users == {111111, 222222, 333333}
-    assert cfg.audio_bitrate == 320
+    assert cfg.audio_bitrate == 256
     assert cfg.max_file_size_mb == 45
     assert cfg.max_file_size_bytes == 45 * 1024 * 1024
     assert cfg.log_level == "DEBUG"
