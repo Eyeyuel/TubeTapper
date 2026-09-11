@@ -1,0 +1,17 @@
+[Unit]
+Description=YouTube to Telegram Music Downloader Bot
+After=network.target
+
+[Service]
+Type=simple
+User=eyuel
+WorkingDirectory=/home/eyuel/Desktop/testAntigravity
+ExecStart=/home/eyuel/Desktop/testAntigravity/.venv/bin/python3 /home/eyuel/Desktop/testAntigravity/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
