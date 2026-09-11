@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 import yt_dlp
 
 from config import AppConfig, config as global_config
+from helpers.artwork import embed_metadata_and_artwork_to_mp3, resolve_album_art
 from helpers.logger import setup_logger
 from helpers.title_cleaner import clean_music_title, parse_title_and_artist
 
@@ -257,17 +258,34 @@ class AudioDownloader:
 
             file_size = mp3_path.stat().st_size
 
-            # Extract 320x320 JPEG thumbnail for Telegram
-            thumb_target = target_dir / f"{video_id}_thumb.jpg"
-            thumbnail_path = self.extract_telegram_thumbnail(mp3_path, thumb_target)
+            # Locate any local candidate thumbnail left by yt-dlp on disk
+            local_candidate_thumb = None
+            for ext in [".jpg", ".jpeg", ".webp", ".png"]:
+                candidate = target_dir / f"{video_id}{ext}"
+                if candidate.exists():
+                    local_candidate_thumb = candidate
+                    break
 
-            # Fallback: check if an un-deleted thumbnail exists
-            if not thumbnail_path:
-                for ext in [".jpg", ".jpeg", ".webp", ".png"]:
-                    candidate_thumb = target_dir / f"{video_id}{ext}"
-                    if candidate_thumb.exists():
-                        thumbnail_path = str(candidate_thumb)
-                        break
+            # Resolve best square cover/album artwork (iTunes -> Deezer -> Local -> YouTube Crop)
+            thumb_target = target_dir / f"{video_id}_thumb.jpg"
+            youtube_thumb_url = info.get("thumbnail")
+            thumbnail_path = resolve_album_art(
+                artist=artist,
+                song_name=song_name,
+                youtube_thumb_url=youtube_thumb_url,
+                mp3_path=mp3_path,
+                output_thumb_path=thumb_target,
+                fallback_thumb_path=local_candidate_thumb,
+            )
+
+            # Embed ID3 tags and square cover art into the MP3 file itself
+            if thumbnail_path and Path(thumbnail_path).exists():
+                embed_metadata_and_artwork_to_mp3(
+                    mp3_path=mp3_path,
+                    art_path=Path(thumbnail_path),
+                    title=display_title,
+                    artist=artist,
+                )
 
             return {
                 "id": video_id,
