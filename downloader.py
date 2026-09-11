@@ -1,6 +1,7 @@
 """Audio downloader and playlist processing module using yt-dlp and ffmpeg for the YouTube to Telegram Music Downloader Bot."""
 
 import asyncio
+import subprocess
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlparse
@@ -9,6 +10,7 @@ import yt_dlp
 
 from config import AppConfig, config as global_config
 from helpers.logger import setup_logger
+from helpers.title_cleaner import clean_music_title, parse_title_and_artist
 
 logger = setup_logger("downloader")
 
@@ -70,13 +72,17 @@ class AudioDownloader:
             if not info:
                 raise ValueError(f"No metadata returned for {url}")
 
-            title = info.get("title", "Unknown Title")
-            artist = (
+            raw_title = info.get("title", "Unknown Title")
+            raw_artist = (
                 info.get("artist")
                 or info.get("creator")
                 or info.get("uploader")
                 or "Unknown Artist"
             )
+            display_title, artist, song_name = parse_title_and_artist(
+                raw_title, raw_artist
+            )
+
             duration = int(info.get("duration") or 0)
             thumbnail_url = info.get("thumbnail")
             webpage_url = info.get("webpage_url", url)
@@ -85,7 +91,8 @@ class AudioDownloader:
 
             return {
                 "id": info.get("id", ""),
-                "title": title,
+                "title": display_title,
+                "song_name": song_name,
                 "artist": artist,
                 "duration": duration,
                 "thumbnail_url": thumbnail_url,
@@ -124,10 +131,13 @@ class AudioDownloader:
                 if not video_url and video_id:
                     video_url = f"https://www.youtube.com/watch?v={video_id}"
 
+                raw_title = entry.get("title", "Unknown Title")
+                cleaned_title = clean_music_title(raw_title)
+
                 tracks.append(
                     {
                         "id": video_id,
-                        "title": entry.get("title", "Unknown Title"),
+                        "title": cleaned_title,
                         "duration": int(entry.get("duration") or 0),
                         "url": video_url or "",
                     }
@@ -139,6 +149,44 @@ class AudioDownloader:
                 "total_tracks": len(tracks),
                 "tracks": tracks,
             }
+
+    def extract_telegram_thumbnail(
+        self, mp3_path: Path, output_thumb_path: Path
+    ) -> Optional[str]:
+        """Extracts embedded cover artwork from MP3 and formats it to a 320x320 JPEG (<200KB) for Telegram."""
+        if not mp3_path.exists():
+            return None
+
+        try:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(mp3_path),
+                "-an",
+                "-vf",
+                "scale=320:320:force_original_aspect_ratio=decrease",
+                "-frames:v",
+                "1",
+                "-update",
+                "1",
+                "-q:v",
+                "2",
+                str(output_thumb_path),
+            ]
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if output_thumb_path.exists() and output_thumb_path.stat().st_size > 0:
+                logger.debug(f"Successfully extracted Telegram thumbnail: {output_thumb_path}")
+                return str(output_thumb_path)
+        except Exception as exc:
+            logger.warning(f"Failed to extract telegram thumbnail: {exc}")
+
+        return None
 
     def download_audio(
         self, url: str, output_dir: Optional[Union[str, Path]] = None
@@ -185,12 +233,15 @@ class AudioDownloader:
                 raise ValueError(f"Download failed for {url}")
 
             video_id = info.get("id", "")
-            title = info.get("title", "Unknown Title")
-            artist = (
+            raw_title = info.get("title", "Unknown Title")
+            raw_artist = (
                 info.get("artist")
                 or info.get("creator")
                 or info.get("uploader")
                 or "Unknown Artist"
+            )
+            display_title, artist, song_name = parse_title_and_artist(
+                raw_title, raw_artist
             )
             duration = int(info.get("duration") or 0)
 
@@ -206,21 +257,26 @@ class AudioDownloader:
 
             file_size = mp3_path.stat().st_size
 
-            # Locate thumbnail file if preserved on disk
-            thumbnail_path = None
-            for ext in [".jpg", ".jpeg", ".webp", ".png"]:
-                candidate_thumb = target_dir / f"{video_id}{ext}"
-                if candidate_thumb.exists():
-                    thumbnail_path = candidate_thumb
-                    break
+            # Extract 320x320 JPEG thumbnail for Telegram
+            thumb_target = target_dir / f"{video_id}_thumb.jpg"
+            thumbnail_path = self.extract_telegram_thumbnail(mp3_path, thumb_target)
+
+            # Fallback: check if an un-deleted thumbnail exists
+            if not thumbnail_path:
+                for ext in [".jpg", ".jpeg", ".webp", ".png"]:
+                    candidate_thumb = target_dir / f"{video_id}{ext}"
+                    if candidate_thumb.exists():
+                        thumbnail_path = str(candidate_thumb)
+                        break
 
             return {
                 "id": video_id,
                 "file_path": str(mp3_path),
-                "title": title,
+                "title": display_title,
+                "song_name": song_name,
                 "artist": artist,
                 "duration": duration,
-                "thumbnail_path": str(thumbnail_path) if thumbnail_path else None,
+                "thumbnail_path": thumbnail_path,
                 "filesize": file_size,
                 "exceeds_limit": file_size > self.config.max_file_size_bytes,
             }
