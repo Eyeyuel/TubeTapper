@@ -147,3 +147,39 @@ def test_embed_metadata_and_artwork_to_mp3_missing_files(tmp_path):
     fake_art = tmp_path / "art.jpg"
     assert embed_metadata_and_artwork_to_mp3(fake_mp3, fake_art, "Title", "Artist") is False
 
+
+def test_resolve_album_art_concurrent_deezer_fallback(tmp_path):
+    """Test concurrent resolution falls back to Deezer when iTunes is empty/unavailable."""
+    out_file = tmp_path / "deezer_fallback.jpg"
+    with patch("helpers.artwork.fetch_itunes_artwork", return_value=None), \
+         patch("helpers.artwork.fetch_deezer_artwork", return_value={"artwork_path": str(out_file)}):
+        result = resolve_album_art(
+            artist="Kodak Black",
+            song_name="Tunnel Vision",
+            youtube_thumb_url=None,
+            mp3_path=None,
+            output_thumb_path=out_file,
+        )
+        assert result == str(out_file)
+
+
+def test_crop_to_square_jpeg_from_url(tmp_path):
+    """Test crop_to_square_jpeg fetches URL bytes and invokes ffmpeg pipe."""
+    out_file = tmp_path / "cropped_url.jpg"
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.content = b"FAKE_IMAGE_BYTES"
+
+    def mock_ffmpeg(cmd, **kwargs):
+        out_file.write_bytes(b"CROPPED_JPEG")
+        res = MagicMock()
+        res.returncode = 0
+        return res
+
+    with patch("httpx.Client.get", return_value=mock_resp), \
+         patch("subprocess.run", side_effect=mock_ffmpeg):
+        res = crop_to_square_jpeg("https://example.com/cover.jpg", out_file)
+        assert res == str(out_file)
+        assert out_file.read_bytes() == b"CROPPED_JPEG"
+
+

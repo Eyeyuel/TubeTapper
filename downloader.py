@@ -200,7 +200,7 @@ class AudioDownloader:
         outtmpl = str(target_dir / "%(id)s.%(ext)s")
 
         ydl_opts = {
-            "format": "bestaudio/best",
+            "format": "ba[ext=m4a]/ba[ext=opus]/bestaudio/best",
             "outtmpl": outtmpl,
             "postprocessors": [
                 {
@@ -208,16 +208,10 @@ class AudioDownloader:
                     "preferredcodec": "mp3",
                     "preferredquality": str(self.bitrate),
                 },
-                {
-                    "key": "FFmpegMetadata",
-                    "add_metadata": True,
-                },
-                {
-                    "key": "EmbedThumbnail",
-                    "already_have_thumbnail": False,
-                },
             ],
             "writethumbnail": True,
+            "concurrent_fragment_downloads": 4,
+            "buffersize": 1024 * 64,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,

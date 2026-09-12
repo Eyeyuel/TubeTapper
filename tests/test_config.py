@@ -19,7 +19,7 @@ def test_default_config_loading(monkeypatch, tmp_path):
 
     assert cfg.bot_token == ""
     assert cfg.allowed_users == set()
-    assert cfg.audio_bitrate == 320
+    assert cfg.audio_bitrate == 192
     assert cfg.max_file_size_mb == 50
     assert cfg.max_file_size_bytes == 50 * 1024 * 1024
     assert cfg.download_dir.exists()

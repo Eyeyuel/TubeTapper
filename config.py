@@ -20,7 +20,7 @@ class AppConfig:
     bot_token: str
     allowed_users: Set[int] = field(default_factory=set)
     download_dir: Path = field(default=Path("./downloads"))
-    audio_bitrate: int = 320
+    audio_bitrate: int = 192
     max_file_size_mb: int = 50
     log_level: str = "INFO"
 
@@ -58,9 +58,9 @@ def load_config() -> AppConfig:
     download_path.mkdir(parents=True, exist_ok=True)
 
     try:
-        bitrate = int(os.getenv("AUDIO_BITRATE", "320").strip())
+        bitrate = int(os.getenv("AUDIO_BITRATE", "192").strip())
     except ValueError:
-        bitrate = 320
+        bitrate = 192
 
     try:
         max_size_mb = int(os.getenv("MAX_FILE_SIZE_MB", "50").strip())

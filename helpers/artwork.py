@@ -1,5 +1,6 @@
 """Cover and Album Art fetcher using iTunes, Deezer, and YouTube 1:1 Square Cropping."""
 
+import concurrent.futures
 import json
 import subprocess
 import urllib.parse
@@ -17,7 +18,43 @@ def crop_to_square_jpeg(source_input: str, output_path: Path) -> Optional[str]:
     """Crops an image or video/audio cover to a 1:1 centered square JPEG (320x320) for Telegram."""
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        # Center-crop to 1:1 square, then scale to 320x320 JPEG
+        is_url = str(source_input).startswith("http://") or str(source_input).startswith("https://")
+
+        # Fast memory buffer via HTTPX to avoid slow TLS handshake inside FFmpeg
+        if is_url:
+            try:
+                with httpx.Client(timeout=2.0, follow_redirects=True) as client:
+                    resp = client.get(str(source_input))
+                    if resp.status_code == 200 and resp.content:
+                        cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-i",
+                            "pipe:0",
+                            "-an",
+                            "-vf",
+                            "crop=min(iw\\,ih):min(iw\\,ih),scale=320:320",
+                            "-frames:v",
+                            "1",
+                            "-update",
+                            "1",
+                            "-q:v",
+                            "2",
+                            str(output_path),
+                        ]
+                        subprocess.run(
+                            cmd,
+                            input=resp.content,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
+                        if output_path.exists() and output_path.stat().st_size > 0:
+                            return str(output_path)
+            except Exception as exc:
+                logger.debug(f"HTTP image fetch failed, falling back to direct ffmpeg input: {exc}")
+
+        # Center-crop local file to 1:1 square, then scale to 320x320 JPEG
         cmd = [
             "ffmpeg",
             "-y",
@@ -61,7 +98,7 @@ def fetch_itunes_artwork(query: str, output_path: Path) -> Optional[Dict[str, st
             f"https://itunes.apple.com/search?term={urllib.parse.quote(query)}"
             "&entity=song&limit=1"
         )
-        with httpx.Client(timeout=3.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=1.5, follow_redirects=True) as client:
             resp = client.get(url)
             if resp.status_code == 200:
                 data = resp.json()
@@ -95,7 +132,7 @@ def fetch_deezer_artwork(query: str, output_path: Path) -> Optional[Dict[str, st
 
     try:
         url = f"https://api.deezer.com/search?q={urllib.parse.quote(query)}&limit=1"
-        with httpx.Client(timeout=3.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=1.5, follow_redirects=True) as client:
             resp = client.get(url)
             if resp.status_code == 200:
                 data = resp.json()
@@ -135,39 +172,52 @@ def resolve_album_art(
     """Retrieves the best available square album art for a music track.
 
     Strategy:
-        1. Try Apple iTunes Search API for official 600x600 square album cover.
-        2. Try Deezer Search API for official square cover.
-        3. Try local fallback thumbnail if provided on disk.
-        4. Fallback: Take YouTube's thumbnail URL and crop to a 1:1 square.
-        5. Fallback: Embedded video stream from MP3 cropped to 1:1 square.
+        1. Query Apple iTunes and Deezer concurrently in parallel (max 1.5s timeout).
+        2. Fast local fallback thumbnail if present on disk (from yt-dlp, ~20ms).
+        3. Fallback: Take YouTube's thumbnail URL and crop to a 1:1 square.
+        4. Fallback: Embedded video stream from MP3 cropped to 1:1 square.
     """
     search_query = f"{artist} {song_name}".strip() if artist else song_name.strip()
 
-    # 1. Try iTunes
-    itunes_res = fetch_itunes_artwork(search_query, output_thumb_path)
-    if itunes_res:
-        return itunes_res["artwork_path"]
+    # 1. Concurrent query to iTunes and Deezer
+    if search_query:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            f_itunes = executor.submit(fetch_itunes_artwork, search_query, output_thumb_path)
+            f_deezer = executor.submit(fetch_deezer_artwork, search_query, output_thumb_path)
 
-    # 2. Try Deezer
-    deezer_res = fetch_deezer_artwork(search_query, output_thumb_path)
-    if deezer_res:
-        return deezer_res["artwork_path"]
+            itunes_res = None
+            try:
+                itunes_res = f_itunes.result(timeout=1.5)
+            except Exception as exc:
+                logger.debug(f"iTunes artwork timeout or error: {exc}")
 
-    # 3. Local fallback thumbnail if present on disk
+            if itunes_res:
+                return itunes_res["artwork_path"]
+
+            deezer_res = None
+            try:
+                deezer_res = f_deezer.result(timeout=0.5)
+            except Exception as exc:
+                logger.debug(f"Deezer artwork timeout or error: {exc}")
+
+            if deezer_res:
+                return deezer_res["artwork_path"]
+
+    # 2. Local fallback thumbnail if present on disk (zero network latency)
     if fallback_thumb_path and Path(fallback_thumb_path).exists():
         local_res = crop_to_square_jpeg(str(fallback_thumb_path), output_thumb_path)
         if local_res:
             return local_res
         return str(fallback_thumb_path)
 
-    # 4. Fallback: YouTube thumbnail URL cropped to 1:1 square
+    # 3. Fallback: YouTube thumbnail URL cropped to 1:1 square
     if youtube_thumb_url:
         yt_res = crop_to_square_jpeg(youtube_thumb_url, output_thumb_path)
         if yt_res:
             logger.debug("Used YouTube thumbnail cropped to 1:1 square")
             return yt_res
 
-    # 5. Fallback: Embedded video stream from MP3 cropped to 1:1 square
+    # 4. Fallback: Embedded video stream from MP3 cropped to 1:1 square
     if mp3_path and mp3_path.exists():
         mp3_res = crop_to_square_jpeg(str(mp3_path), output_thumb_path)
         if mp3_res:
