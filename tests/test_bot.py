@@ -169,6 +169,7 @@ async def test_handle_playlist_flow(tmp_path):
 
     mock_context = MagicMock()
     mock_context.bot.send_audio = AsyncMock()
+    mock_context.bot.send_message = AsyncMock()
 
     mock_downloader = MagicMock()
     mock_downloader.get_playlist_info.return_value = {
@@ -218,3 +219,5 @@ async def test_handle_playlist_flow(tmp_path):
     # Verify send_audio was called twice
     assert mock_context.bot.send_audio.call_count == 2
     assert mock_downloader.cleanup_files.call_count == 2
+    # Verify status message was reposted to trail below uploaded tracks
+    assert mock_context.bot.send_message.call_count >= 2

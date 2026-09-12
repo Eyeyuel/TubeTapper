@@ -150,3 +150,30 @@ async def test_global_error_handler():
     mock_update.effective_message.reply_text.assert_called_once()
     args, _ = mock_update.effective_message.reply_text.call_args
     assert "unexpected error" in args[0]
+
+
+@pytest.mark.asyncio
+async def test_repost_status_message():
+    """Test repost_status_message deletes old message and sends new message at bottom."""
+    from helpers.progress import repost_status_message
+
+    mock_old_msg = MagicMock()
+    mock_old_msg.delete = AsyncMock()
+
+    mock_new_msg = MagicMock()
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock(return_value=mock_new_msg)
+
+    result = await repost_status_message(
+        chat_id=12345,
+        bot=mock_bot,
+        current_message=mock_old_msg,
+        text="New status at bottom",
+    )
+
+    mock_old_msg.delete.assert_called_once()
+    mock_bot.send_message.assert_called_once_with(
+        chat_id=12345, text="New status at bottom", parse_mode="Markdown"
+    )
+    assert result == mock_new_msg
+

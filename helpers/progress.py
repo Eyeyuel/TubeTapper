@@ -1,4 +1,4 @@
-"""Telegram chat progress and status message helpers."""
+from typing import Optional
 
 import telegram
 from helpers.logger import setup_logger
@@ -26,3 +26,24 @@ async def safe_delete_message(message: telegram.Message) -> None:
         await message.delete()
     except Exception as exc:
         logger.debug(f"Error safely deleting message: {exc}")
+
+
+async def repost_status_message(
+    chat_id: int,
+    bot: telegram.Bot,
+    current_message: Optional[telegram.Message],
+    text: str,
+    parse_mode: str = "Markdown",
+) -> telegram.Message:
+    """Safely deletes the previous status message and posts a new one at the bottom of the chat."""
+    if current_message:
+        await safe_delete_message(current_message)
+    try:
+        new_msg = await bot.send_message(
+            chat_id=chat_id, text=text, parse_mode=parse_mode
+        )
+        return new_msg
+    except Exception as exc:
+        logger.warning(f"Error reposting status message to bottom: {exc}")
+        return current_message
+

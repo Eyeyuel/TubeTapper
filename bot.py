@@ -23,7 +23,11 @@ from config import config
 from downloader import AudioDownloader
 from helpers.cleanup import cleanup_orphaned_downloads
 from helpers.logger import setup_logger
-from helpers.progress import safe_delete_message, update_status_message
+from helpers.progress import (
+    repost_status_message,
+    safe_delete_message,
+    update_status_message,
+)
 
 logger = setup_logger("bot")
 
@@ -302,6 +306,22 @@ async def handle_playlist(
                 finally:
                     if thumb_file:
                         thumb_file.close()
+
+            # Reposition the live progress dashboard below the newly uploaded audio track
+            if index < total_tracks:
+                status_msg = await repost_status_message(
+                    chat_id=chat_id,
+                    bot=context.bot,
+                    current_message=status_msg,
+                    text=(
+                        f"📋 *Playlist in Progress:*\n"
+                        f"• Playlist: *{title}*\n"
+                        f"• Total: `{total_tracks}` tracks\n"
+                        f"• ✅ Delivered: `{sent_count}` tracks\n"
+                        f"• ⏳ Next track: `{index + 1}/{total_tracks}`\n\n"
+                        f"⬇️ _Downloading next track..._"
+                    ),
+                )
         except Exception as exc:
             skipped_count += 1
             logger.error(f"Error sending playlist audio track {index}: {exc}")
@@ -310,13 +330,19 @@ async def handle_playlist(
 
     cleanup_orphaned_downloads(config.download_dir)
 
-    await update_status_message(
-        status_msg,
+    # Place final completion report at the very bottom of the conversation
+    final_summary = (
         f"🎉 *Playlist Download Complete!*\n\n"
         f"• Playlist: *{title}*\n"
         f"• Total: `{total}` tracks\n"
         f"• ✅ Delivered: `{sent_count}` tracks\n"
-        f"• ⚠️ Skipped: `{skipped_count}` tracks",
+        f"• ⚠️ Skipped: `{skipped_count}` tracks"
+    )
+    status_msg = await repost_status_message(
+        chat_id=chat_id,
+        bot=context.bot,
+        current_message=status_msg,
+        text=final_summary,
     )
 
 
