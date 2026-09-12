@@ -21,6 +21,7 @@ from telegram.ext import (
 
 from config import config
 from downloader import AudioDownloader
+from helpers.cache import cache_manager
 from helpers.cleanup import cleanup_orphaned_downloads
 from helpers.logger import setup_logger
 from helpers.progress import (
@@ -28,6 +29,7 @@ from helpers.progress import (
     safe_delete_message,
     update_status_message,
 )
+from helpers.queue_manager import queue_manager
 
 logger = setup_logger("bot")
 
@@ -115,9 +117,15 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.effective_message:
         return
 
+    cache_engine = "Redis (In-Memory)" if cache_manager.is_redis_active else "SQLite (Fallback)"
+
     text = (
         "🟢 *Bot Status: Online*\n\n"
         "• Engine: `yt-dlp` + `FFmpeg`\n"
+        f"• Audio Cache: `{cache_engine}`\n"
+        f"• Concurrency Limit: `{config.max_concurrent_downloads} workers`\n"
+        f"• Active Downloads: `{queue_manager.active_count}`\n"
+        f"• Queue Depth: `{queue_manager.waiting_count}`\n"
         f"• Max Upload Size: `{config.max_file_size_mb} MB`\n"
         f"• Audio Quality: `{config.audio_bitrate} kbps MP3`\n"
         "• Playlist Streaming: `Enabled`\n"
@@ -132,72 +140,113 @@ async def handle_single_track(
     url: str,
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    status_msg: Update,
+    status_msg: telegram.Message,
     downloader: AudioDownloader,
 ) -> None:
     """Handles downloading and uploading a single YouTube track."""
     chat_id = update.effective_chat.id
     reply_to = update.effective_message.message_id
 
-    await update_status_message(status_msg, "⬇️ *Downloading audio track...*")
-
-    try:
-        track_data = await asyncio.to_thread(downloader.download_audio, url)
-    except Exception as exc:
-        logger.error(f"Download error for {url}: {exc}")
-        await update_status_message(
-            status_msg, f"❌ *Download failed:*\n`{str(exc)[:150]}`"
-        )
-        return
-
-    # 50MB Telegram Upload Safeguard
-    if track_data.get("exceeds_limit"):
-        size_mb = track_data.get("filesize", 0) // (1024 * 1024)
-        downloader.cleanup_files(
-            track_data.get("file_path"), track_data.get("thumbnail_path")
-        )
-        await update_status_message(
-            status_msg,
-            f"⚠️ *File too large:* Audio file is {size_mb} MB, which exceeds "
-            f"Telegram's {config.max_file_size_mb} MB bot limit. Cannot upload.",
-        )
-        return
-
-    await update_status_message(status_msg, "📤 *Uploading audio to Telegram...*")
-
-    audio_path = track_data["file_path"]
-    thumb_path = track_data.get("thumbnail_path")
-
-    try:
-        with open(audio_path, "rb") as audio_file:
-            thumb_file = (
-                open(thumb_path, "rb")
-                if thumb_path and Path(thumb_path).exists()
-                else None
-            )
-            try:
+    # 1. Instant Cache Check (Telegram file_id reuse)
+    video_id = downloader.extract_video_id(url)
+    if video_id:
+        try:
+            cached = await cache_manager.get(video_id)
+            if cached and cached.get("file_id"):
+                logger.info(f"Delivering cached audio for video ID {video_id}")
+                await update_status_message(status_msg, "⚡ *Found in cache! Delivering audio...*")
                 await context.bot.send_audio(
                     chat_id=chat_id,
-                    audio=audio_file,
-                    title=track_data.get("title"),
-                    performer=track_data.get("artist"),
-                    duration=track_data.get("duration"),
-                    thumbnail=thumb_file,
+                    audio=cached["file_id"],
+                    title=cached.get("title"),
+                    performer=cached.get("artist"),
+                    duration=cached.get("duration"),
                     reply_to_message_id=reply_to,
                 )
-            finally:
-                if thumb_file:
-                    thumb_file.close()
+                await safe_delete_message(status_msg)
+                return
+        except Exception as exc:
+            logger.warning(f"Failed to send cached audio: {exc}. Proceeding to fresh download.")
 
-        await safe_delete_message(status_msg)
-    except Exception as exc:
-        logger.error(f"Failed to upload audio to Telegram: {exc}")
+    # 2. Concurrency-bounded download with queue notification
+    async def notify_queue_position(pos: int) -> None:
         await update_status_message(
-            status_msg, f"❌ *Upload failed:*\n`{str(exc)[:150]}`"
+            status_msg,
+            f"⏳ *Server download capacity reached.*\n"
+            f"• You are in queue: `#{pos}`\n"
+            f"• _Your download will start automatically once a slot opens!_",
         )
-    finally:
-        downloader.cleanup_files(audio_path, thumb_path)
-        cleanup_orphaned_downloads(config.download_dir)
+
+    async with queue_manager.acquire_slot(notify_callback=notify_queue_position):
+        await update_status_message(status_msg, "⬇️ *Downloading audio track...*")
+
+        try:
+            track_data = await asyncio.to_thread(downloader.download_audio, url)
+        except Exception as exc:
+            logger.error(f"Download error for {url}: {exc}")
+            await update_status_message(
+                status_msg, f"❌ *Download failed:*\n`{str(exc)[:150]}`"
+            )
+            return
+
+        # 50MB Telegram Upload Safeguard
+        if track_data.get("exceeds_limit"):
+            size_mb = track_data.get("filesize", 0) // (1024 * 1024)
+            downloader.cleanup_files(
+                track_data.get("file_path"), track_data.get("thumbnail_path")
+            )
+            await update_status_message(
+                status_msg,
+                f"⚠️ *File too large:* Audio file is {size_mb} MB, which exceeds "
+                f"Telegram's {config.max_file_size_mb} MB bot limit. Cannot upload.",
+            )
+            return
+
+        await update_status_message(status_msg, "📤 *Uploading audio to Telegram...*")
+
+        audio_path = track_data["file_path"]
+        thumb_path = track_data.get("thumbnail_path")
+
+        try:
+            with open(audio_path, "rb") as audio_file:
+                thumb_file = (
+                    open(thumb_path, "rb")
+                    if thumb_path and Path(thumb_path).exists()
+                    else None
+                )
+                try:
+                    sent_msg = await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=audio_file,
+                        title=track_data.get("title"),
+                        performer=track_data.get("artist"),
+                        duration=track_data.get("duration"),
+                        thumbnail=thumb_file,
+                        reply_to_message_id=reply_to,
+                    )
+                finally:
+                    if thumb_file:
+                        thumb_file.close()
+
+            # Save newly uploaded file_id into cache for instant delivery next time
+            if video_id and sent_msg and sent_msg.audio:
+                await cache_manager.set(
+                    video_id=video_id,
+                    file_id=sent_msg.audio.file_id,
+                    title=track_data.get("title"),
+                    artist=track_data.get("artist"),
+                    duration=track_data.get("duration"),
+                )
+
+            await safe_delete_message(status_msg)
+        except Exception as exc:
+            logger.error(f"Failed to upload audio to Telegram: {exc}")
+            await update_status_message(
+                status_msg, f"❌ *Upload failed:*\n`{str(exc)[:150]}`"
+            )
+        finally:
+            downloader.cleanup_files(audio_path, thumb_path)
+            cleanup_orphaned_downloads(config.download_dir)
 
 
 async def handle_playlist(
@@ -250,7 +299,9 @@ async def handle_playlist(
     sent_count = 0
     skipped_count = 0
 
-    async for index, total_tracks, track_data, error in downloader.stream_playlist_tracks(url):
+    async for index, total_tracks, track_data, error in downloader.stream_playlist_tracks(
+        url, cache_manager=cache_manager
+    ):
         if error:
             skipped_count += 1
             logger.warning(f"Skipping track {index}/{total_tracks}: {error}")
@@ -276,6 +327,36 @@ async def handle_playlist(
             )
             continue
 
+        # Case A: Instant Cached Track Delivery
+        if track_data.get("is_cached") and track_data.get("file_id"):
+            try:
+                await context.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=track_data["file_id"],
+                    title=track_data.get("title"),
+                    performer=track_data.get("artist"),
+                    duration=track_data.get("duration"),
+                )
+                sent_count += 1
+                if index < total_tracks:
+                    status_msg = await repost_status_message(
+                        chat_id=chat_id,
+                        bot=context.bot,
+                        current_message=status_msg,
+                        text=(
+                            f"📋 *Playlist in Progress:*\n"
+                            f"• Playlist: *{title}*\n"
+                            f"• Total: `{total_tracks}` tracks\n"
+                            f"• ✅ Delivered: `{sent_count}` tracks (⚡ cached)\n"
+                            f"• ⏳ Next track: `{index + 1}/{total_tracks}`\n\n"
+                            f"⬇️ _Downloading next track..._"
+                        ),
+                    )
+                continue
+            except Exception as exc:
+                logger.warning(f"Error sending cached playlist track ({exc}). Re-downloading...")
+
+        # Case B: Downloaded Track Upload
         await update_status_message(
             status_msg,
             f"📋 *Playlist:* {title}\n"
@@ -294,7 +375,7 @@ async def handle_playlist(
                     else None
                 )
                 try:
-                    await context.bot.send_audio(
+                    sent_msg = await context.bot.send_audio(
                         chat_id=chat_id,
                         audio=audio_file,
                         title=track_data.get("title"),
@@ -306,6 +387,17 @@ async def handle_playlist(
                 finally:
                     if thumb_file:
                         thumb_file.close()
+
+            # Cache the newly uploaded track
+            track_id = track_data.get("id")
+            if track_id and sent_msg and sent_msg.audio:
+                await cache_manager.set(
+                    video_id=track_id,
+                    file_id=sent_msg.audio.file_id,
+                    title=track_data.get("title"),
+                    artist=track_data.get("artist"),
+                    duration=track_data.get("duration"),
+                )
 
             # Reposition the live progress dashboard below the newly uploaded audio track
             if index < total_tracks:
@@ -398,22 +490,33 @@ async def global_error_handler(
             logger.debug(f"Could not send error message to user: {exc}")
 
 
+async def on_startup(application: Application) -> None:
+    """Initializes async services like Redis cache on application start."""
+    await cache_manager.initialize()
+
+
 def create_bot_app(token: Optional[str] = None) -> Application:
-    """Builds and returns the configured Telegram Application."""
+    """Builds and returns the configured Telegram Application with concurrent update processing."""
     bot_token = token or config.bot_token
     if not bot_token or bot_token == "your_telegram_bot_token_here":
         bot_token = "TEST_TOKEN_FOR_INITIALIZATION"
 
-    application = ApplicationBuilder().token(bot_token).build()
+    application = (
+        ApplicationBuilder()
+        .token(bot_token)
+        .concurrent_updates(True)
+        .post_init(on_startup)
+        .build()
+    )
 
-    # Register command handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("status", status_command))
+    # Register command handlers with block=False for parallel execution
+    application.add_handler(CommandHandler("start", start_command, block=False))
+    application.add_handler(CommandHandler("help", help_command, block=False))
+    application.add_handler(CommandHandler("status", status_command, block=False))
 
-    # Register message handler for text
+    # Register message handler for text with block=False for parallel execution
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message, block=False)
     )
 
     # Register global error handler

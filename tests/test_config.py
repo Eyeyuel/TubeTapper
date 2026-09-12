@@ -23,6 +23,8 @@ def test_default_config_loading(monkeypatch, tmp_path):
     assert cfg.max_file_size_mb == 50
     assert cfg.max_file_size_bytes == 50 * 1024 * 1024
     assert cfg.max_playlist_tracks == 25
+    assert cfg.max_concurrent_downloads == 5
+    assert cfg.cache_ttl_days == 30
     assert cfg.download_dir.exists()
     assert cfg.is_user_allowed(12345) is True  # Empty whitelist allows everyone
 
@@ -36,6 +38,11 @@ def test_custom_config_values(monkeypatch, tmp_path):
     monkeypatch.setenv("AUDIO_BITRATE", "256")
     monkeypatch.setenv("MAX_FILE_SIZE_MB", "45")
     monkeypatch.setenv("MAX_PLAYLIST_TRACKS", "30")
+    monkeypatch.setenv("MAX_CONCURRENT_DOWNLOADS", "8")
+    monkeypatch.setenv("REDIS_URL", "redis://redis-host:6379/1")
+    monkeypatch.setenv("YOUTUBE_COOKIES_FILE", "/path/to/cookies.txt")
+    monkeypatch.setenv("YOUTUBE_PROXY", "http://proxy:8080")
+    monkeypatch.setenv("CACHE_TTL_DAYS", "60")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
 
     cfg = load_config()
@@ -46,6 +53,11 @@ def test_custom_config_values(monkeypatch, tmp_path):
     assert cfg.max_file_size_mb == 45
     assert cfg.max_file_size_bytes == 45 * 1024 * 1024
     assert cfg.max_playlist_tracks == 30
+    assert cfg.max_concurrent_downloads == 8
+    assert cfg.redis_url == "redis://redis-host:6379/1"
+    assert cfg.youtube_cookies_file == "/path/to/cookies.txt"
+    assert cfg.youtube_proxy == "http://proxy:8080"
+    assert cfg.cache_ttl_days == 60
     assert cfg.log_level == "DEBUG"
     assert cfg.download_dir.resolve() == test_dir.resolve()
     assert cfg.download_dir.exists()

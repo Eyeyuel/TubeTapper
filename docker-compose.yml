@@ -1,0 +1,48 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: tubetapper_redis
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tubetapper_bot
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DOWNLOAD_DIR=/app/downloads
+    volumes:
+      - downloads_data:/app/downloads
+      # Optional: mount cookies.txt if available locally for YouTube bot bypass
+      # - ./cookies.txt:/app/cookies.txt:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  redis_data:
+    driver: local
+  downloads_data:
+    driver: local

@@ -64,6 +64,11 @@ def test_create_bot_app_handlers():
     assert "help" in command_names
     assert "status" in command_names
 
+    # Verify concurrent updates and non-blocking handler execution
+    assert app.concurrent_updates == 256
+    for h in handlers:
+        assert h.block is False
+
 
 @pytest.mark.asyncio
 async def test_start_command():
@@ -94,7 +99,7 @@ async def test_help_command():
 
 @pytest.mark.asyncio
 async def test_status_command():
-    """Test /status command reports online status."""
+    """Test /status command reports online status and cache/concurrency stats."""
     mock_update = MagicMock()
     mock_update.effective_message.reply_text = AsyncMock()
     mock_context = MagicMock()
@@ -103,6 +108,8 @@ async def test_status_command():
     mock_update.effective_message.reply_text.assert_called_once()
     args, _ = mock_update.effective_message.reply_text.call_args
     assert "Online" in args[0]
+    assert "Audio Cache" in args[0]
+    assert "Concurrency Limit" in args[0]
 
 
 @pytest.mark.asyncio
@@ -129,18 +136,22 @@ async def test_handle_single_track_flow(tmp_path):
     mock_status.delete = AsyncMock()
 
     mock_context = MagicMock()
-    mock_context.bot.send_audio = AsyncMock()
+    mock_context.bot.send_audio = AsyncMock(
+        return_value=MagicMock(audio=MagicMock(file_id="CQACAgQAAxkBAAIC123"))
+    )
 
     mock_downloader = MagicMock()
+    mock_downloader.extract_video_id.return_value = "uncached_test_id"
     mock_downloader.download_audio.return_value = mock_track_data
 
-    await handle_single_track(
-        "https://youtu.be/test_id",
-        mock_update,
-        mock_context,
-        mock_status,
-        mock_downloader,
-    )
+    with patch("bot.cache_manager.get", new_callable=AsyncMock, return_value=None):
+        await handle_single_track(
+            "https://youtu.be/uncached_test_id",
+            mock_update,
+            mock_context,
+            mock_status,
+            mock_downloader,
+        )
 
     # Verify send_audio was called with correct parameters
     mock_context.bot.send_audio.assert_called_once()
@@ -152,6 +163,51 @@ async def test_handle_single_track_flow(tmp_path):
 
     # Verify cleanup was invoked
     mock_downloader.cleanup_files.assert_called_once_with(str(fake_mp3), None)
+
+
+@pytest.mark.asyncio
+async def test_handle_single_track_cache_hit_flow():
+    """Test single track cache hit delivers audio instantly without downloading."""
+    from helpers.cache import cache_manager
+
+    # Prime cache with a known track
+    await cache_manager.set(
+        video_id="cached_vid_99",
+        file_id="FILE_ID_CACHED",
+        title="Cached Song",
+        artist="Cached Artist",
+        duration=150,
+    )
+
+    mock_update = MagicMock()
+    mock_update.effective_chat.id = 12345
+    mock_update.effective_message.message_id = 99
+    mock_status = MagicMock()
+    mock_status.edit_text = AsyncMock()
+    mock_status.delete = AsyncMock()
+
+    mock_context = MagicMock()
+    mock_context.bot.send_audio = AsyncMock()
+
+    mock_downloader = MagicMock()
+    mock_downloader.extract_video_id.return_value = "cached_vid_99"
+
+    await handle_single_track(
+        "https://youtu.be/cached_vid_99",
+        mock_update,
+        mock_context,
+        mock_status,
+        mock_downloader,
+    )
+
+    # Verify download_audio was NEVER invoked because it hit the cache
+    mock_downloader.download_audio.assert_not_called()
+
+    # Verify send_audio was called immediately with the cached file_id
+    mock_context.bot.send_audio.assert_called_once()
+    _, kwargs = mock_context.bot.send_audio.call_args
+    assert kwargs["audio"] == "FILE_ID_CACHED"
+    assert kwargs["title"] == "Cached Song"
 
 
 @pytest.mark.asyncio
@@ -178,7 +234,7 @@ async def test_handle_playlist_flow(tmp_path):
     }
 
     # Simulate generator yielding 2 tracks
-    async def mock_stream(url):
+    async def mock_stream(url, *args, **kwargs):
         yield (
             1,
             2,

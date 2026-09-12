@@ -3,7 +3,7 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Set
+from typing import Optional, Set
 
 from dotenv import load_dotenv
 
@@ -23,6 +23,11 @@ class AppConfig:
     audio_bitrate: int = 192
     max_file_size_mb: int = 50
     max_playlist_tracks: int = 25
+    max_concurrent_downloads: int = 5
+    redis_url: Optional[str] = "redis://localhost:6379/0"
+    youtube_cookies_file: Optional[str] = None
+    youtube_proxy: Optional[str] = None
+    cache_ttl_days: int = 30
     log_level: str = "INFO"
 
     @property
@@ -73,6 +78,25 @@ def load_config() -> AppConfig:
     except ValueError:
         max_playlist = 25
 
+    try:
+        max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5").strip())
+    except ValueError:
+        max_concurrent = 5
+
+    raw_redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0").strip()
+    redis_url = raw_redis_url if raw_redis_url else None
+
+    raw_cookies = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+    youtube_cookies_file = raw_cookies if raw_cookies else None
+
+    raw_proxy = os.getenv("YOUTUBE_PROXY", "").strip()
+    youtube_proxy = raw_proxy if raw_proxy else None
+
+    try:
+        cache_ttl = int(os.getenv("CACHE_TTL_DAYS", "30").strip())
+    except ValueError:
+        cache_ttl = 30
+
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
     return AppConfig(
@@ -82,6 +106,11 @@ def load_config() -> AppConfig:
         audio_bitrate=bitrate,
         max_file_size_mb=max_size_mb,
         max_playlist_tracks=max_playlist,
+        max_concurrent_downloads=max_concurrent,
+        redis_url=redis_url,
+        youtube_cookies_file=youtube_cookies_file,
+        youtube_proxy=youtube_proxy,
+        cache_ttl_days=cache_ttl,
         log_level=log_level,
     )
 

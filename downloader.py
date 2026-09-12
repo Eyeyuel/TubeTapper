@@ -77,6 +77,35 @@ class AudioDownloader:
 
         return False
 
+    def extract_video_id(self, url: str) -> Optional[str]:
+        """Extracts YouTube video ID from single track URLs."""
+        if not url:
+            return None
+        try:
+            parsed = urlparse(url)
+            netloc = parsed.netloc.lower()
+            if "youtu.be" in netloc:
+                parts = parsed.path.strip("/").split("/")
+                return parts[0] if parts and parts[0] else None
+            if "youtube.com" in netloc:
+                if parsed.path == "/watch":
+                    qs = parse_qs(parsed.query)
+                    return qs.get("v", [None])[0]
+                for prefix in ("/shorts/", "/live/", "/embed/"):
+                    if parsed.path.startswith(prefix):
+                        return parsed.path[len(prefix) :].split("/")[0]
+        except Exception as exc:
+            logger.debug(f"Error extracting video ID: {exc}")
+        return None
+
+    def _apply_network_options(self, opts: Dict[str, Any]) -> Dict[str, Any]:
+        """Injects cookies file and proxy settings if configured."""
+        if self.config.youtube_cookies_file and Path(self.config.youtube_cookies_file).exists():
+            opts["cookiefile"] = str(self.config.youtube_cookies_file)
+        if self.config.youtube_proxy:
+            opts["proxy"] = str(self.config.youtube_proxy)
+        return opts
+
     def get_video_info(self, url: str) -> Dict[str, Any]:
         """Extracts video metadata without downloading the media stream."""
         ydl_opts = {
@@ -86,6 +115,7 @@ class AudioDownloader:
             "no_warnings": True,
             "noplaylist": True,
         }
+        ydl_opts = self._apply_network_options(ydl_opts)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
@@ -138,6 +168,8 @@ class AudioDownloader:
         }
         if is_radio:
             ydl_opts["playlist_items"] = f"1-{self.config.max_playlist_tracks}"
+
+        ydl_opts = self._apply_network_options(ydl_opts)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
@@ -252,6 +284,7 @@ class AudioDownloader:
             "no_warnings": True,
             "noplaylist": True,
         }
+        ydl_opts = self._apply_network_options(ydl_opts)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
@@ -334,6 +367,7 @@ class AudioDownloader:
         url: str,
         max_tracks: Optional[int] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        cache_manager: Optional[Any] = None,
     ) -> AsyncGenerator[Tuple[int, int, Optional[Dict[str, Any]], Optional[str]], None]:
         """Asynchronously streams downloaded tracks from a playlist one by one.
 
@@ -356,6 +390,28 @@ class AudioDownloader:
             if not track_url:
                 yield (index, total, None, "Invalid or missing video URL")
                 continue
+
+            track_id = track.get("id") or self.extract_video_id(track_url)
+            if cache_manager and track_id:
+                try:
+                    cached = await cache_manager.get(track_id)
+                    if cached:
+                        yield (
+                            index,
+                            total,
+                            {
+                                "id": track_id,
+                                "is_cached": True,
+                                "file_id": cached["file_id"],
+                                "title": cached.get("title") or track.get("title", "Audio Track"),
+                                "artist": cached.get("artist", ""),
+                                "duration": cached.get("duration", 0),
+                            },
+                            None,
+                        )
+                        continue
+                except Exception as exc:
+                    logger.debug(f"Cache check error in playlist stream: {exc}")
 
             try:
                 track_data = await asyncio.to_thread(
