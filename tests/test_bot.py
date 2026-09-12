@@ -21,9 +21,17 @@ def test_youtube_url_regex():
     valid_urls = [
         "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         "http://youtube.com/watch?v=dQw4w9WgXcQ&t=10s",
+        "https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://music.youtube.com/playlist?list=OLAK5uy_12345",
         "https://youtu.be/dQw4w9WgXcQ",
+        "https://youtu.be/dQw4w9WgXcQ?si=12345678",
         "https://www.youtube.com/playlist?list=PL1234567890abcdef",
         "https://youtube.com/shorts/abc12345678",
+        "https://www.youtube.com/live/dQw4w9WgXcQ",
+        "https://www.youtube.com/embed/dQw4w9WgXcQ",
+        "https://www.youtube.com/watch?v=hpyn5amYwCY&list=PLx3zFT7knx14i0_n7ou8AZ3h_dh-ARWh6",
+        "https://www.youtube.com/watch?v=i_kF4zLNKio&list=RDJzSUgOmP66Q&index=5",
         "Check this out: https://youtu.be/dQw4w9WgXcQ! It is cool.",
     ]
     for text in valid_urls:

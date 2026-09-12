@@ -31,12 +31,32 @@ def test_is_playlist_detection(downloader):
     assert downloader.is_playlist("https://www.youtube.com/watch?v=dQw4w9WgXcQ") is False
     assert downloader.is_playlist("https://youtu.be/dQw4w9WgXcQ") is False
 
-    # Algorithmic radio mixes (RD...) with a video parameter should not be treated as static playlists
-    assert downloader.is_playlist("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDdQw4w9WgXcQ") is False
+    # Radio mixes (RD...) are now supported as playlists
+    assert downloader.is_playlist("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDdQw4w9WgXcQ") is True
+    assert downloader.is_playlist("https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=RDAMVMdQw4w9WgXcQ") is True
 
     # Non-YouTube or empty URLs
     assert downloader.is_playlist("https://vimeo.com/123456") is False
     assert downloader.is_playlist("") is False
+
+
+def test_normalize_playlist_url(downloader):
+    """Test playlist URL normalization for canonical vs radio vs watch formats."""
+    # Standard watch + list
+    target, is_radio, pid = downloader.normalize_playlist_url(
+        "https://www.youtube.com/watch?v=hpyn5amYwCY&list=PLx3zFT7knx14i0_n7ou8AZ3h_dh-ARWh6"
+    )
+    assert target == "https://www.youtube.com/playlist?list=PLx3zFT7knx14i0_n7ou8AZ3h_dh-ARWh6"
+    assert is_radio is False
+    assert pid == "PLx3zFT7knx14i0_n7ou8AZ3h_dh-ARWh6"
+
+    # Radio mix preserves video query context
+    radio_url = "https://www.youtube.com/watch?v=i_kF4zLNKio&list=RDJzSUgOmP66Q&index=5"
+    target_radio, is_radio_flag, radio_id = downloader.normalize_playlist_url(radio_url)
+    assert target_radio == radio_url
+    assert is_radio_flag is True
+    assert radio_id == "RDJzSUgOmP66Q"
+
 
 
 def test_get_playlist_info_success(downloader):

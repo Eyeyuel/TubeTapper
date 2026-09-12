@@ -25,8 +25,36 @@ class AudioDownloader:
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.bitrate = self.config.audio_bitrate
 
+    def normalize_playlist_url(self, url: str) -> Tuple[str, bool, Optional[str]]:
+        """Normalizes any YouTube playlist URL to its canonical target.
+
+        Returns:
+            (target_url, is_radio_mix, playlist_id)
+        """
+        if not url:
+            return url, False, None
+        try:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            playlist_id = qs.get("list", [None])[0]
+
+            if not playlist_id:
+                return url, False, None
+
+            is_radio = playlist_id.startswith("RD")
+            if is_radio:
+                # Radio Mixes require the video context query
+                return url, True, playlist_id
+
+            # Canonical playlist endpoint for standard playlists (PL, OLAK, UU, FL, etc.)
+            canonical_url = f"https://www.youtube.com/playlist?list={playlist_id}"
+            return canonical_url, False, playlist_id
+        except Exception as exc:
+            logger.debug(f"Error normalizing playlist URL: {exc}")
+            return url, False, None
+
     def is_playlist(self, url: str) -> bool:
-        """Accurately detects if a URL is a YouTube playlist."""
+        """Accurately detects if a URL is a YouTube playlist or Radio Mix."""
         if not url:
             return False
         try:
@@ -39,13 +67,9 @@ class AudioDownloader:
             if "/playlist" in parsed.path:
                 return True
 
-            # Check query parameters
+            # Check query parameters for playlist or radio mix (list=)
             qs = parse_qs(parsed.query)
             if "list" in qs and qs["list"]:
-                playlist_id = qs["list"][0]
-                # Algorithmic radio mixes (RD...) are not static extractable playlists
-                if playlist_id.startswith("RD") and "v" in qs:
-                    return False
                 return True
         except Exception as e:
             logger.debug(f"Error parsing URL in is_playlist: {e}")
@@ -104,22 +128,33 @@ class AudioDownloader:
 
     def get_playlist_info(self, url: str) -> Dict[str, Any]:
         """Fast extraction of playlist metadata and entry list without downloading media."""
+        target_url, is_radio, playlist_id = self.normalize_playlist_url(url)
+
         ydl_opts = {
             "skip_download": True,
-            "extract_flat": True,
+            "extract_flat": "in_playlist",
             "quiet": True,
             "no_warnings": True,
         }
+        if is_radio:
+            ydl_opts["playlist_items"] = f"1-{self.config.max_playlist_tracks}"
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
-                info = ydl.extract_info(url, download=False)
+                info = ydl.extract_info(target_url, download=False)
             except Exception as e:
-                logger.error(f"Failed to extract playlist info for {url}: {e}")
+                logger.error(f"Failed to extract playlist info for {target_url}: {e}")
                 raise
 
             if not info:
-                raise ValueError(f"No playlist metadata returned for {url}")
+                raise ValueError(f"No playlist metadata returned for {target_url}")
+
+            # If yt-dlp returned a pointer/redirect object, follow the underlying target URL
+            if info.get("_type") == "url" and info.get("url"):
+                try:
+                    info = ydl.extract_info(info["url"], download=False)
+                except Exception as exc:
+                    logger.warning(f"Error following playlist redirect URL: {exc}")
 
             raw_entries = info.get("entries") or []
             tracks: List[Dict[str, Any]] = []
@@ -145,10 +180,11 @@ class AudioDownloader:
                 )
 
             return {
-                "id": info.get("id", ""),
+                "id": info.get("id", playlist_id or ""),
                 "title": info.get("title", "YouTube Playlist"),
                 "total_tracks": len(tracks),
                 "tracks": tracks,
+                "is_radio_mix": is_radio,
             }
 
     def extract_telegram_thumbnail(
@@ -307,7 +343,10 @@ class AudioDownloader:
         playlist_info = await asyncio.to_thread(self.get_playlist_info, url)
         tracks = playlist_info.get("tracks", [])
 
-        if max_tracks and max_tracks > 0:
+        effective_max = max_tracks or self.config.max_playlist_tracks
+        if playlist_info.get("is_radio_mix"):
+            tracks = tracks[:effective_max]
+        elif max_tracks and max_tracks > 0:
             tracks = tracks[:max_tracks]
 
         total = len(tracks)

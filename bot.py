@@ -27,9 +27,10 @@ from helpers.progress import safe_delete_message, update_status_message
 
 logger = setup_logger("bot")
 
-# Regex to match YouTube single video, short, and playlist URLs
+# Universal regex matching all YouTube URL domains (youtube.com, m.youtube.com, music.youtube.com, youtu.be)
+# and endpoints (watch, playlist, shorts, live, embed, and shortened youtu.be IDs)
 YOUTUBE_URL_REGEX = re.compile(
-    r"(https?://(?:www\.)?(?:youtube\.com/(?:watch\?[^\s]+|playlist\?[^\s]+|shorts/[a-zA-Z0-9_-]+)|youtu\.be/[a-zA-Z0-9_-]+[^\s]*))"
+    r"(https?://(?:[a-zA-Z0-9_.-]+\.)?(?:youtube\.com|youtu\.be)/(?:watch\?[^\s]+|playlist\?[^\s]+|shorts/[a-zA-Z0-9_-]+|live/[a-zA-Z0-9_-]+|embed/[a-zA-Z0-9_-]+|[a-zA-Z0-9_-]+[^\s]*))"
 )
 
 

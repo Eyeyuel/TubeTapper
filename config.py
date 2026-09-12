@@ -22,6 +22,7 @@ class AppConfig:
     download_dir: Path = field(default=Path("./downloads"))
     audio_bitrate: int = 192
     max_file_size_mb: int = 50
+    max_playlist_tracks: int = 25
     log_level: str = "INFO"
 
     @property
@@ -67,6 +68,11 @@ def load_config() -> AppConfig:
     except ValueError:
         max_size_mb = 50
 
+    try:
+        max_playlist = int(os.getenv("MAX_PLAYLIST_TRACKS", "25").strip())
+    except ValueError:
+        max_playlist = 25
+
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
     return AppConfig(
@@ -75,6 +81,7 @@ def load_config() -> AppConfig:
         download_dir=download_path,
         audio_bitrate=bitrate,
         max_file_size_mb=max_size_mb,
+        max_playlist_tracks=max_playlist,
         log_level=log_level,
     )
 

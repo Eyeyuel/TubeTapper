@@ -22,6 +22,7 @@ def test_default_config_loading(monkeypatch, tmp_path):
     assert cfg.audio_bitrate == 192
     assert cfg.max_file_size_mb == 50
     assert cfg.max_file_size_bytes == 50 * 1024 * 1024
+    assert cfg.max_playlist_tracks == 25
     assert cfg.download_dir.exists()
     assert cfg.is_user_allowed(12345) is True  # Empty whitelist allows everyone
 
@@ -34,6 +35,7 @@ def test_custom_config_values(monkeypatch, tmp_path):
     monkeypatch.setenv("DOWNLOAD_DIR", str(test_dir))
     monkeypatch.setenv("AUDIO_BITRATE", "256")
     monkeypatch.setenv("MAX_FILE_SIZE_MB", "45")
+    monkeypatch.setenv("MAX_PLAYLIST_TRACKS", "30")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
 
     cfg = load_config()
@@ -43,6 +45,7 @@ def test_custom_config_values(monkeypatch, tmp_path):
     assert cfg.audio_bitrate == 256
     assert cfg.max_file_size_mb == 45
     assert cfg.max_file_size_bytes == 45 * 1024 * 1024
+    assert cfg.max_playlist_tracks == 30
     assert cfg.log_level == "DEBUG"
     assert cfg.download_dir.resolve() == test_dir.resolve()
     assert cfg.download_dir.exists()
