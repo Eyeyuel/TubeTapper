@@ -8,7 +8,15 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import telegram
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonCommands,
+    Update,
+)
 from telegram.constants import ChatAction
 from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import (
@@ -774,9 +782,13 @@ async def on_startup(application: Application) -> None:
             await application.bot.set_my_description(description=ONBOARDING_DESCRIPTION)
         if hasattr(application.bot, "set_my_short_description"):
             await application.bot.set_my_short_description(short_description=SHORT_DESCRIPTION)
+        # Register commands for all scopes so typing '/' in chat immediately shows autocompletion
         if hasattr(application.bot, "set_my_commands"):
-            await application.bot.set_my_commands(BOT_COMMANDS)
-        logger.info("Successfully registered Telegram native onboarding screen and bot commands.")
+            await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
+            await application.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+        if hasattr(application.bot, "set_chat_menu_button"):
+            await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        logger.info("Successfully registered Telegram native onboarding screen, commands autocompletion, and menu button.")
     except Exception as exc:
         logger.debug(f"Could not set native Telegram descriptions (expected in offline/test mode): {exc}")
 

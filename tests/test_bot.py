@@ -85,13 +85,15 @@ async def test_onboarding_descriptions_and_startup():
     mock_app.bot.set_my_description = AsyncMock()
     mock_app.bot.set_my_short_description = AsyncMock()
     mock_app.bot.set_my_commands = AsyncMock()
+    mock_app.bot.set_chat_menu_button = AsyncMock()
 
     with patch("bot.cache_manager.initialize", new_callable=AsyncMock) as mock_init:
         await on_startup(mock_app)
         mock_init.assert_called_once()
         mock_app.bot.set_my_description.assert_called_once_with(description=ONBOARDING_DESCRIPTION)
         mock_app.bot.set_my_short_description.assert_called_once_with(short_description=SHORT_DESCRIPTION)
-        mock_app.bot.set_my_commands.assert_called_once_with(BOT_COMMANDS)
+        assert mock_app.bot.set_my_commands.call_count == 2
+        mock_app.bot.set_chat_menu_button.assert_called_once()
 
 
 @pytest.mark.asyncio
