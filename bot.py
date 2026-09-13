@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import telegram
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import (
@@ -740,9 +740,45 @@ async def global_error_handler(
             logger.debug(f"Could not send error message to user: {exc}")
 
 
+ONBOARDING_DESCRIPTION = (
+    "🎵 Welcome to TubeTapper! 🎧\n\n"
+    "Your instant high-quality music companion on Telegram.\n\n"
+    "✨ What you can do:\n"
+    "• 🔍 In-Chat Search: Just type any song or artist name (e.g. 'Queen Bohemian Rhapsody')\n"
+    "• 🔗 Direct Links: Paste any YouTube video, playlist, or mix URL\n"
+    "• ⚡ Studio Audio: Clean metadata & HD square album art\n"
+    "• ⚙️ Audio Quality: Choose 192k, 320k MP3, or source-quality Native M4A\n\n"
+    "Tap 'Start' below to begin downloading music!"
+)
+
+SHORT_DESCRIPTION = (
+    "Instant YouTube Music Downloader. Send song names or links to get studio audio with album art!"
+)
+
+BOT_COMMANDS = [
+    BotCommand("start", "Start the bot & see welcome guide"),
+    BotCommand("search", "Search for songs by title or artist"),
+    BotCommand("settings", "Choose audio format & quality (MP3/M4A)"),
+    BotCommand("status", "Check bot health, cache & queue stats"),
+    BotCommand("help", "View full instructions & tips"),
+]
+
+
 async def on_startup(application: Application) -> None:
-    """Initializes async services like Redis cache on application start."""
+    """Initializes async services and registers native Telegram onboarding screen & commands."""
     await cache_manager.initialize()
+
+    # Configure Telegram native onboarding screen ("What can this bot do?") and menu commands
+    try:
+        if hasattr(application.bot, "set_my_description"):
+            await application.bot.set_my_description(description=ONBOARDING_DESCRIPTION)
+        if hasattr(application.bot, "set_my_short_description"):
+            await application.bot.set_my_short_description(short_description=SHORT_DESCRIPTION)
+        if hasattr(application.bot, "set_my_commands"):
+            await application.bot.set_my_commands(BOT_COMMANDS)
+        logger.info("Successfully registered Telegram native onboarding screen and bot commands.")
+    except Exception as exc:
+        logger.debug(f"Could not set native Telegram descriptions (expected in offline/test mode): {exc}")
 
 
 def create_bot_app(token: Optional[str] = None) -> Application:

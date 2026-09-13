@@ -5,12 +5,16 @@ from pathlib import Path
 import pytest
 
 from bot import (
+    BOT_COMMANDS,
+    ONBOARDING_DESCRIPTION,
+    SHORT_DESCRIPTION,
     YOUTUBE_URL_REGEX,
     create_bot_app,
     handle_message,
     handle_playlist,
     handle_single_track,
     help_command,
+    on_startup,
     start_command,
     status_command,
 )
@@ -68,6 +72,26 @@ def test_create_bot_app_handlers():
     assert app.concurrent_updates == 256
     for h in handlers:
         assert h.block is False
+
+
+@pytest.mark.asyncio
+async def test_onboarding_descriptions_and_startup():
+    """Test Telegram native onboarding description, short description, and menu commands."""
+    assert len(ONBOARDING_DESCRIPTION) <= 512, "Telegram description limit is 512 chars"
+    assert len(SHORT_DESCRIPTION) <= 120, "Telegram short description limit is 120 chars"
+    assert len(BOT_COMMANDS) >= 4
+
+    mock_app = MagicMock()
+    mock_app.bot.set_my_description = AsyncMock()
+    mock_app.bot.set_my_short_description = AsyncMock()
+    mock_app.bot.set_my_commands = AsyncMock()
+
+    with patch("bot.cache_manager.initialize", new_callable=AsyncMock) as mock_init:
+        await on_startup(mock_app)
+        mock_init.assert_called_once()
+        mock_app.bot.set_my_description.assert_called_once_with(description=ONBOARDING_DESCRIPTION)
+        mock_app.bot.set_my_short_description.assert_called_once_with(short_description=SHORT_DESCRIPTION)
+        mock_app.bot.set_my_commands.assert_called_once_with(BOT_COMMANDS)
 
 
 @pytest.mark.asyncio
