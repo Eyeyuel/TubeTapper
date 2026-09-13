@@ -5,14 +5,16 @@ import os
 import re
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import telegram
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
 from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -25,6 +27,7 @@ from helpers.cache import cache_manager
 from helpers.cleanup import cleanup_orphaned_downloads
 from helpers.logger import setup_logger
 from helpers.progress import (
+    render_progress_bar,
     repost_status_message,
     safe_delete_message,
     update_status_message,
@@ -38,6 +41,67 @@ logger = setup_logger("bot")
 YOUTUBE_URL_REGEX = re.compile(
     r"(https?://(?:[a-zA-Z0-9_.-]+\.)?(?:youtube\.com|youtu\.be)/(?:watch\?[^\s]+|playlist\?[^\s]+|shorts/[a-zA-Z0-9_-]+|live/[a-zA-Z0-9_-]+|embed/[a-zA-Z0-9_-]+|[a-zA-Z0-9_-]+[^\s]*))"
 )
+
+# Registry of active playlist cancellation events keyed by chat_id
+ACTIVE_PLAYLIST_CANCELLATIONS: Dict[int, asyncio.Event] = {}
+
+
+async def send_upload_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Sends native Telegram chat action 'uploading audio...' safely."""
+    try:
+        action_coro = context.bot.send_chat_action(
+            chat_id=chat_id, action=ChatAction.UPLOAD_VOICE
+        )
+        if asyncio.iscoroutine(action_coro):
+            await action_coro
+    except Exception as exc:
+        logger.debug(f"send_chat_action notice error (non-fatal): {exc}")
+
+
+async def get_user_audio_format(user_id: int) -> Tuple[str, int]:
+    """Retrieves user's preferred audio format and bitrate.
+    
+    Returns: (audio_format, bitrate) e.g. ('mp3', 192), ('mp3', 320), or ('m4a', 0)
+    """
+    pref = await cache_manager.get_user_setting(user_id, "audio_format", "mp3_192")
+    if pref == "mp3_320":
+        return "mp3", 320
+    elif pref == "m4a":
+        return "m4a", 0
+    return "mp3", 192
+
+
+def build_settings_keyboard(current_pref: str) -> InlineKeyboardMarkup:
+    """Builds inline keyboard for audio format selection with a checkmark on the active setting."""
+    b1_check = " ✅" if current_pref == "mp3_192" else ""
+    b2_check = " ✅" if current_pref == "mp3_320" else ""
+    b3_check = " ✅" if current_pref == "m4a" else ""
+
+    keyboard = [
+        [InlineKeyboardButton(f"🎵 MP3 - 192 kbps (Standard){b1_check}", callback_data="set_fmt:mp3_192")],
+        [InlineKeyboardButton(f"🎧 MP3 - 320 kbps (High Quality){b2_check}", callback_data="set_fmt:mp3_320")],
+        [InlineKeyboardButton(f"⚡ M4A - Native Source Copy (Fastest){b3_check}", callback_data="set_fmt:m4a")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_search_keyboard(results: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    """Builds an inline keyboard of up to 5 search results."""
+    keyboard = []
+    for item in results:
+        title = item.get("title", "Unknown Track")
+        duration = item.get("duration")
+        dur_str = f" ({duration // 60}:{duration % 60:02d})" if duration else ""
+        btn_text = f"🎵 {title[:48]}{dur_str}"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"dl:{item['id']}")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_cancel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """Builds inline keyboard with a Cancel button for active playlists."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel Playlist Download", callback_data=f"cancel_pl:{chat_id}")]
+    ])
 
 
 def restricted(func: Callable) -> Callable:
@@ -70,16 +134,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     text = (
-        "🎵 *Welcome to the YouTube Music Downloader Bot!* 🎧\n\n"
-        "Send me any YouTube video or playlist link, and I will extract the audio as a "
-        "high-quality MP3 (with album artwork and metadata) and send it directly to this chat!\n\n"
-        "📌 *Supported Formats:*\n"
-        "• Single track: `https://youtu.be/...`\n"
-        "• Single video: `https://www.youtube.com/watch?v=...`\n"
-        "• Full playlist: `https://www.youtube.com/playlist?list=...`\n"
-        "• Radio Mix: `https://www.youtube.com/watch?v=...&list=RD...` (up to 25 tracks)\n\n"
-        "💡 _Tip: Radio mixes are dynamically generated on the fly. To get an exact, unchangeable playlist, save the mix to a YouTube playlist first and share the saved `PL...` link!_\n\n"
-        "Send a link now or type /help for details."
+        "🎵 *Welcome to TubeTapper Music Downloader!* 🎧\n\n"
+        "Send me any YouTube link or just type a song name to search directly!\n\n"
+        "📌 *Features & Usage:*\n"
+        "• *Direct Search:* Type any song name (e.g. `Blinding Lights The Weeknd`)\n"
+        "• *Single Video:* `https://youtu.be/...` or `https://www.youtube.com/watch?v=...`\n"
+        "• *Full Playlist:* `https://www.youtube.com/playlist?list=...`\n"
+        "• *Radio Mix:* `https://www.youtube.com/watch?v=...&list=RD...`\n"
+        "• *Audio Quality:* Type /settings to choose MP3 (192k/320k) or Native M4A\n\n"
+        "💡 _Tip: During playlist downloads, you can tap [❌ Cancel Download] at any time!_\n\n"
+        "Send a link or song name now, or type /help for details."
     )
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
@@ -92,20 +156,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = (
         "ℹ️ *How to Use This Bot:*\n\n"
-        "1️⃣ Copy a YouTube link (single song, playlist, or mix).\n"
-        "2️⃣ Paste and send the link here.\n"
-        "3️⃣ The bot will extract, convert to MP3, and upload the tracks.\n\n"
+        "1️⃣ *Search directly:* Just type any song or artist name (e.g. `/search Queen` or `Queen Bohemian Rhapsody`).\n"
+        "2️⃣ *Or paste a link:* Send any YouTube video, playlist, or mix URL.\n"
+        "3️⃣ *Choose audio quality:* Use /settings to switch between MP3 192k, MP3 320k, and Native M4A.\n\n"
         "💡 *Important Note on YouTube Mixes (`list=RD...`):*\n"
-        "YouTube Radio Mixes are dynamically generated on the fly by YouTube's recommendation engine, "
-        "so the songs may differ from your current browser session. If you want an exact, fixed playlist in a specific order, "
-        "save the mix to your YouTube library first and send the saved playlist link (`list=PL...`).\n\n"
+        "YouTube Radio Mixes are dynamically generated on the fly by YouTube's recommendation engine. "
+        "To get an exact, fixed playlist in a specific order, save the mix to your library first and send the `list=PL...` link.\n\n"
         "⚙️ *Audio Specifications:*\n"
-        f"• Format: MP3 ({config.audio_bitrate} kbps)\n"
-        "• Embedded tags: Title, Artist, and Cover Artwork\n\n"
+        "• Formats: MP3 (192/320 kbps) or Native M4A source-copy\n"
+        "• Embedded tags: High-res Cover Artwork, Title, and Artist metadata\n\n"
         "⚠️ *Limitations & Safeguards:*\n"
         f"• Maximum file size: {config.max_file_size_mb} MB (Telegram Bot API limit).\n"
-        f"• Playlists & Radio Mixes: Capped at {config.max_playlist_tracks} tracks.\n"
-        "• Live streams cannot be converted to MP3.\n"
+        f"• Playlists: Capped at {config.max_playlist_tracks} tracks.\n"
+        "• Live streams cannot be converted.\n"
         "• Private or geo-restricted videos will be skipped gracefully."
     )
     await update.effective_message.reply_text(text, parse_mode="Markdown")
@@ -127,13 +190,87 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"• Active Downloads: `{queue_manager.active_count}`\n"
         f"• Queue Depth: `{queue_manager.waiting_count}`\n"
         f"• Max Upload Size: `{config.max_file_size_mb} MB`\n"
-        f"• Audio Quality: `{config.audio_bitrate} kbps MP3`\n"
-        "• Playlist Streaming: `Enabled`\n"
+        f"• Default Audio Quality: `{config.audio_bitrate} kbps MP3`\n"
+        "• Pipelined Streaming: `Enabled`\n"
         "• Access Control: "
         f"`{'Restricted' if config.allowed_users else 'Public'}`\n"
         "• Ready to download audio!"
     )
     await update.effective_message.reply_text(text, parse_mode="Markdown")
+
+
+@restricted
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lets user customize preferred audio format and quality."""
+    if not update.effective_message or not update.effective_user:
+        return
+
+    user_id = update.effective_user.id
+    current_pref = await cache_manager.get_user_setting(user_id, "audio_format", "mp3_192")
+
+    text = (
+        "⚙️ *Audio Download Settings*\n\n"
+        "Choose your preferred audio format and quality for downloads:\n\n"
+        "• *MP3 192 kbps*: Balanced quality & compact file size (default).\n"
+        "• *MP3 320 kbps*: Studio / high-fidelity audio quality.\n"
+        "• *M4A Native Copy*: Zero re-encoding, instant extraction directly from YouTube streams."
+    )
+    await update.effective_message.reply_text(
+        text,
+        reply_markup=build_settings_keyboard(current_pref),
+        parse_mode="Markdown",
+    )
+
+
+async def execute_search(
+    query: str, update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Performs YouTube search and renders interactive download buttons."""
+    if not update.effective_message:
+        return
+
+    status_msg = await update.effective_message.reply_text(
+        f"🔍 *Searching YouTube for:* `{query}`...", parse_mode="Markdown"
+    )
+    downloader = AudioDownloader()
+    try:
+        results = await asyncio.to_thread(downloader.search_youtube, query, max_results=5)
+    except Exception as exc:
+        logger.error(f"Search error for '{query}': {exc}")
+        await update_status_message(status_msg, f"❌ *Search failed:*\n`{str(exc)[:120]}`")
+        return
+
+    if not results:
+        await update_status_message(
+            status_msg,
+            f"🔍 No results found for *{query}*. Try checking the spelling or pasting a direct YouTube URL.",
+        )
+        return
+
+    text = f"🔍 *Top results for:* `{query}`\nTap a track below to download:"
+    await update_status_message(
+        status_msg,
+        text,
+        reply_markup=build_search_keyboard(results),
+    )
+
+
+@restricted
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Searches YouTube and returns top results as interactive download buttons."""
+    if not update.effective_message:
+        return
+
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        await update.effective_message.reply_text(
+            "🔍 *Search YouTube:*\nPlease provide a search query.\n\n"
+            "*Usage:* `/search <song or artist>`\n*Example:* `/search Bohemian Rhapsody Queen`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await execute_search(query, update, context)
 
 
 async def handle_single_track(
@@ -145,7 +282,10 @@ async def handle_single_track(
 ) -> None:
     """Handles downloading and uploading a single YouTube track."""
     chat_id = update.effective_chat.id
-    reply_to = update.effective_message.message_id
+    reply_to = update.effective_message.message_id if update.effective_message else None
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    audio_format, bitrate = await get_user_audio_format(user_id)
 
     # 1. Instant Cache Check (Telegram file_id reuse)
     video_id = downloader.extract_video_id(url)
@@ -155,6 +295,7 @@ async def handle_single_track(
             if cached and cached.get("file_id"):
                 logger.info(f"Delivering cached audio for video ID {video_id}")
                 await update_status_message(status_msg, "⚡ *Found in cache! Delivering audio...*")
+                await send_upload_action(context, chat_id)
                 await context.bot.send_audio(
                     chat_id=chat_id,
                     audio=cached["file_id"],
@@ -181,7 +322,9 @@ async def handle_single_track(
         await update_status_message(status_msg, "⬇️ *Downloading audio track...*")
 
         try:
-            track_data = await asyncio.to_thread(downloader.download_audio, url)
+            track_data = await asyncio.to_thread(
+                downloader.download_audio, url, None, audio_format, bitrate
+            )
         except Exception as exc:
             logger.error(f"Download error for {url}: {exc}")
             await update_status_message(
@@ -203,6 +346,7 @@ async def handle_single_track(
             return
 
         await update_status_message(status_msg, "📤 *Uploading audio to Telegram...*")
+        await send_upload_action(context, chat_id)
 
         audio_path = track_data["file_path"]
         thumb_path = track_data.get("thumbnail_path")
@@ -253,11 +397,18 @@ async def handle_playlist(
     url: str,
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    status_msg: Update,
+    status_msg: telegram.Message,
     downloader: AudioDownloader,
 ) -> None:
-    """Handles downloading and uploading a YouTube playlist sequentially."""
+    """Handles downloading and uploading a YouTube playlist with pipelined streaming and cancellation."""
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else 0
+    audio_format, bitrate = await get_user_audio_format(user_id)
+
+    # Register cancellation event for this chat
+    cancel_event = asyncio.Event()
+    ACTIVE_PLAYLIST_CANCELLATIONS[chat_id] = cancel_event
+    cancel_kb = build_cancel_keyboard(chat_id)
 
     await update_status_message(status_msg, "🔎 *Extracting playlist metadata...*")
 
@@ -268,6 +419,7 @@ async def handle_playlist(
         await update_status_message(
             status_msg, f"❌ *Failed to read playlist:*\n`{str(exc)[:150]}`"
         )
+        ACTIVE_PLAYLIST_CANCELLATIONS.pop(chat_id, None)
         return
 
     title = playlist_info.get("title", "YouTube Playlist")
@@ -277,6 +429,7 @@ async def handle_playlist(
         await update_status_message(
             status_msg, "⚠️ *Playlist is empty or contains no accessible videos.*"
         )
+        ACTIVE_PLAYLIST_CANCELLATIONS.pop(chat_id, None)
         return
 
     is_radio = playlist_info.get("is_radio_mix", False)
@@ -286,59 +439,152 @@ async def handle_playlist(
             f"*{title}* (capped at `{total}` tracks)\n\n"
             "ℹ️ _Note: Radio mixes are dynamically generated by YouTube and may differ from your current browser queue. "
             "To download an exact, fixed playlist, save it on YouTube first and share the saved `PL...` link._\n\n"
-            "Starting sequential download..."
+            "Starting pipelined download..."
         )
     else:
         notice_text = (
             f"📋 *Playlist detected:*\n*{title}* ({total} tracks)\n\n"
-            "Starting sequential download..."
+            "Starting pipelined download..."
         )
 
-    await update_status_message(status_msg, notice_text)
+    await update_status_message(status_msg, notice_text, reply_markup=cancel_kb)
 
     sent_count = 0
     skipped_count = 0
+    last_processed_index = 0
 
-    async for index, total_tracks, track_data, error in downloader.stream_playlist_tracks(
-        url, cache_manager=cache_manager
-    ):
-        if error:
-            skipped_count += 1
-            logger.warning(f"Skipping track {index}/{total_tracks}: {error}")
-            await update_status_message(
-                status_msg,
-                f"📋 *Playlist:* {title}\n"
-                f"⏳ Progress: `[{index}/{total_tracks}]`\n"
-                f"⚠️ *Skipped track {index}:* `{error[:60]}`",
-            )
-            continue
+    # Select streaming method (pipelined by default, or fallback/mocked stream_playlist_tracks)
+    stream_fn = getattr(downloader, "stream_playlist_pipelined", None)
+    try:
+        from unittest.mock import Mock
+        if stream_fn is None or isinstance(stream_fn, Mock):
+            alt_fn = getattr(downloader, "stream_playlist_tracks", None)
+            if alt_fn is not None and not isinstance(alt_fn, Mock):
+                stream_fn = alt_fn
+    except ImportError:
+        pass
+    if stream_fn is None:
+        stream_fn = downloader.stream_playlist_pipelined
 
-        if not track_data or track_data.get("exceeds_limit"):
-            skipped_count += 1
-            if track_data:
-                downloader.cleanup_files(
-                    track_data.get("file_path"), track_data.get("thumbnail_path")
+    try:
+        async for index, total_tracks, track_data, error in stream_fn(
+            url=url,
+            cache_manager=cache_manager,
+            cancel_event=cancel_event,
+            audio_format=audio_format,
+            bitrate=bitrate,
+        ):
+            last_processed_index = index
+            if cancel_event.is_set():
+                break
+
+            progress_bar = render_progress_bar((index / total_tracks) * 100 if total_tracks else 0)
+
+            if error:
+                skipped_count += 1
+                logger.warning(f"Skipping track {index}/{total_tracks}: {error}")
+                await update_status_message(
+                    status_msg,
+                    f"📋 *Playlist:* {title}\n"
+                    f"⏳ Progress: {progress_bar} `[{index}/{total_tracks}]`\n"
+                    f"⚠️ *Skipped track {index}:* `{error[:60]}`",
+                    reply_markup=cancel_kb,
                 )
+                continue
+
+            if not track_data or track_data.get("exceeds_limit"):
+                skipped_count += 1
+                if track_data:
+                    downloader.cleanup_files(
+                        track_data.get("file_path"), track_data.get("thumbnail_path")
+                    )
+                await update_status_message(
+                    status_msg,
+                    f"📋 *Playlist:* {title}\n"
+                    f"⏳ Progress: {progress_bar} `[{index}/{total_tracks}]`\n"
+                    f"⚠️ *Track {index} exceeds {config.max_file_size_mb}MB limit (Skipped).* ",
+                    reply_markup=cancel_kb,
+                )
+                continue
+
+            # Case A: Instant Cached Track Delivery
+            if track_data.get("is_cached") and track_data.get("file_id"):
+                try:
+                    await send_upload_action(context, chat_id)
+                    await context.bot.send_audio(
+                        chat_id=chat_id,
+                        audio=track_data["file_id"],
+                        title=track_data.get("title"),
+                        performer=track_data.get("artist"),
+                        duration=track_data.get("duration"),
+                    )
+                    sent_count += 1
+                    if index < total_tracks and not cancel_event.is_set():
+                        status_msg = await repost_status_message(
+                            chat_id=chat_id,
+                            bot=context.bot,
+                            current_message=status_msg,
+                            text=(
+                                f"📋 *Playlist in Progress:*\n"
+                                f"• Playlist: *{title}*\n"
+                                f"• Progress: {progress_bar} `[{index}/{total_tracks}]`\n"
+                                f"• ✅ Delivered: `{sent_count}` tracks (⚡ cached)\n"
+                                f"• ⏳ Next track: `{index + 1}/{total_tracks}`\n\n"
+                                f"⬇️ _Downloading next track..._"
+                            ),
+                            reply_markup=cancel_kb,
+                        )
+                    continue
+                except Exception as exc:
+                    logger.warning(f"Error sending cached playlist track ({exc}). Re-downloading...")
+
+            # Case B: Downloaded Track Upload
             await update_status_message(
                 status_msg,
                 f"📋 *Playlist:* {title}\n"
-                f"⏳ Progress: `[{index}/{total_tracks}]`\n"
-                f"⚠️ *Track {index} exceeds {config.max_file_size_mb}MB limit (Skipped).* ",
+                f"⏳ Progress: {progress_bar} `[{index}/{total_tracks}]`\n"
+                f"📤 Uploading: *{track_data.get('title')}*...",
+                reply_markup=cancel_kb,
             )
-            continue
 
-        # Case A: Instant Cached Track Delivery
-        if track_data.get("is_cached") and track_data.get("file_id"):
+            audio_path = track_data["file_path"]
+            thumb_path = track_data.get("thumbnail_path")
+
             try:
-                await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=track_data["file_id"],
-                    title=track_data.get("title"),
-                    performer=track_data.get("artist"),
-                    duration=track_data.get("duration"),
-                )
-                sent_count += 1
-                if index < total_tracks:
+                await send_upload_action(context, chat_id)
+                with open(audio_path, "rb") as audio_file:
+                    thumb_file = (
+                        open(thumb_path, "rb")
+                        if thumb_path and Path(thumb_path).exists()
+                        else None
+                    )
+                    try:
+                        sent_msg = await context.bot.send_audio(
+                            chat_id=chat_id,
+                            audio=audio_file,
+                            title=track_data.get("title"),
+                            performer=track_data.get("artist"),
+                            duration=track_data.get("duration"),
+                            thumbnail=thumb_file,
+                        )
+                        sent_count += 1
+                    finally:
+                        if thumb_file:
+                            thumb_file.close()
+
+                # Cache the newly uploaded track
+                track_id = track_data.get("id")
+                if track_id and sent_msg and sent_msg.audio:
+                    await cache_manager.set(
+                        video_id=track_id,
+                        file_id=sent_msg.audio.file_id,
+                        title=track_data.get("title"),
+                        artist=track_data.get("artist"),
+                        duration=track_data.get("duration"),
+                    )
+
+                # Reposition the live progress dashboard below the newly uploaded audio track
+                if index < total_tracks and not cancel_event.is_set():
                     status_msg = await repost_status_message(
                         chat_id=chat_id,
                         bot=context.bot,
@@ -346,101 +592,101 @@ async def handle_playlist(
                         text=(
                             f"📋 *Playlist in Progress:*\n"
                             f"• Playlist: *{title}*\n"
-                            f"• Total: `{total_tracks}` tracks\n"
-                            f"• ✅ Delivered: `{sent_count}` tracks (⚡ cached)\n"
+                            f"• Progress: {progress_bar} `[{index}/{total_tracks}]`\n"
+                            f"• ✅ Delivered: `{sent_count}` tracks\n"
                             f"• ⏳ Next track: `{index + 1}/{total_tracks}`\n\n"
                             f"⬇️ _Downloading next track..._"
                         ),
+                        reply_markup=cancel_kb,
                     )
-                continue
             except Exception as exc:
-                logger.warning(f"Error sending cached playlist track ({exc}). Re-downloading...")
+                skipped_count += 1
+                logger.error(f"Error sending playlist audio track {index}: {exc}")
+            finally:
+                downloader.cleanup_files(audio_path, thumb_path)
 
-        # Case B: Downloaded Track Upload
-        await update_status_message(
-            status_msg,
-            f"📋 *Playlist:* {title}\n"
-            f"⏳ Progress: `[{index}/{total_tracks}]`\n"
-            f"📤 Uploading: *{track_data.get('title')}*...",
+    finally:
+        ACTIVE_PLAYLIST_CANCELLATIONS.pop(chat_id, None)
+        cleanup_orphaned_downloads(config.download_dir)
+
+    # Final completion or cancellation report
+    if cancel_event.is_set():
+        final_summary = (
+            f"🛑 *Playlist Download Cancelled by User.*\n\n"
+            f"• Playlist: *{title}*\n"
+            f"• ✅ Delivered: `{sent_count}` tracks\n"
+            f"• ⏹️ Stopped after track `{last_processed_index}/{total}`"
+        )
+    else:
+        final_summary = (
+            f"🎉 *Playlist Download Complete!*\n\n"
+            f"• Playlist: *{title}*\n"
+            f"• Total: `{total}` tracks\n"
+            f"• ✅ Delivered: `{sent_count}` tracks\n"
+            f"• ⚠️ Skipped: `{skipped_count}` tracks"
         )
 
-        audio_path = track_data["file_path"]
-        thumb_path = track_data.get("thumbnail_path")
-
-        try:
-            with open(audio_path, "rb") as audio_file:
-                thumb_file = (
-                    open(thumb_path, "rb")
-                    if thumb_path and Path(thumb_path).exists()
-                    else None
-                )
-                try:
-                    sent_msg = await context.bot.send_audio(
-                        chat_id=chat_id,
-                        audio=audio_file,
-                        title=track_data.get("title"),
-                        performer=track_data.get("artist"),
-                        duration=track_data.get("duration"),
-                        thumbnail=thumb_file,
-                    )
-                    sent_count += 1
-                finally:
-                    if thumb_file:
-                        thumb_file.close()
-
-            # Cache the newly uploaded track
-            track_id = track_data.get("id")
-            if track_id and sent_msg and sent_msg.audio:
-                await cache_manager.set(
-                    video_id=track_id,
-                    file_id=sent_msg.audio.file_id,
-                    title=track_data.get("title"),
-                    artist=track_data.get("artist"),
-                    duration=track_data.get("duration"),
-                )
-
-            # Reposition the live progress dashboard below the newly uploaded audio track
-            if index < total_tracks:
-                status_msg = await repost_status_message(
-                    chat_id=chat_id,
-                    bot=context.bot,
-                    current_message=status_msg,
-                    text=(
-                        f"📋 *Playlist in Progress:*\n"
-                        f"• Playlist: *{title}*\n"
-                        f"• Total: `{total_tracks}` tracks\n"
-                        f"• ✅ Delivered: `{sent_count}` tracks\n"
-                        f"• ⏳ Next track: `{index + 1}/{total_tracks}`\n\n"
-                        f"⬇️ _Downloading next track..._"
-                    ),
-                )
-        except Exception as exc:
-            skipped_count += 1
-            logger.error(f"Error sending playlist audio track {index}: {exc}")
-        finally:
-            downloader.cleanup_files(audio_path, thumb_path)
-
-    cleanup_orphaned_downloads(config.download_dir)
-
-    # Place final completion report at the very bottom of the conversation
-    final_summary = (
-        f"🎉 *Playlist Download Complete!*\n\n"
-        f"• Playlist: *{title}*\n"
-        f"• Total: `{total}` tracks\n"
-        f"• ✅ Delivered: `{sent_count}` tracks\n"
-        f"• ⚠️ Skipped: `{skipped_count}` tracks"
-    )
-    status_msg = await repost_status_message(
+    await repost_status_message(
         chat_id=chat_id,
         bot=context.bot,
         current_message=status_msg,
         text=final_summary,
+        reply_markup=None,
     )
 
 
 @restricted
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Routes callback queries for search results, format settings, and playlist cancellation."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    data = query.data
+
+    if data.startswith("dl:"):
+        await query.answer()
+        video_id = data.split("dl:", 1)[1]
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        status_msg = await query.message.reply_text(
+            "🔎 *Analyzing YouTube track...*", parse_mode="Markdown"
+        )
+        downloader = AudioDownloader()
+        await handle_single_track(url, update, context, status_msg, downloader)
+
+    elif data.startswith("cancel_pl:"):
+        target_chat_id = int(data.split("cancel_pl:", 1)[1])
+        event = ACTIVE_PLAYLIST_CANCELLATIONS.get(target_chat_id)
+        if event:
+            event.set()
+            await query.answer("Playlist download cancellation requested!", show_alert=True)
+            logger.info(f"Cancellation requested for chat_id={target_chat_id}")
+        else:
+            await query.answer("No active playlist download found to cancel.", show_alert=True)
+
+    elif data.startswith("set_fmt:"):
+        chosen_fmt = data.split("set_fmt:", 1)[1]
+        user_id = update.effective_user.id if update.effective_user else 0
+        await cache_manager.set_user_setting(user_id, "audio_format", chosen_fmt)
+
+        fmt_names = {
+            "mp3_192": "MP3 (192 kbps)",
+            "mp3_320": "MP3 (320 kbps)",
+            "m4a": "M4A (Native Source Copy)",
+        }
+        name = fmt_names.get(chosen_fmt, chosen_fmt)
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=build_settings_keyboard(chosen_fmt)
+            )
+        except Exception:
+            pass
+        await query.answer(f"Quality updated to {name}!")
+
+
+@restricted
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Inspects text messages for YouTube URLs and dispatches downloads."""
+    """Inspects text messages for YouTube URLs or triggers YouTube search."""
     if not update.effective_message or not update.effective_message.text:
         return
 
@@ -448,11 +694,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     match = YOUTUBE_URL_REGEX.search(text)
 
     if not match:
-        await update.effective_message.reply_text(
-            "Please send a valid YouTube video or playlist link (e.g., `https://youtu.be/...`). "
-            "Type /help for instructions.",
-            parse_mode="Markdown",
-        )
+        # Fallback to direct search if text has sufficient length
+        if len(text) >= 2:
+            await execute_search(text, update, context)
+        else:
+            await update.effective_message.reply_text(
+                "Please send a valid YouTube video/playlist link, or type a song name to search. "
+                "Type /help for instructions.",
+                parse_mode="Markdown",
+            )
         return
 
     url = match.group(1)
@@ -513,6 +763,11 @@ def create_bot_app(token: Optional[str] = None) -> Application:
     application.add_handler(CommandHandler("start", start_command, block=False))
     application.add_handler(CommandHandler("help", help_command, block=False))
     application.add_handler(CommandHandler("status", status_command, block=False))
+    application.add_handler(CommandHandler("settings", settings_command, block=False))
+    application.add_handler(CommandHandler("search", search_command, block=False))
+
+    # Register callback query handler for buttons (download, cancel, settings)
+    application.add_handler(CallbackQueryHandler(handle_callback_query, block=False))
 
     # Register message handler for text with block=False for parallel execution
     application.add_handler(
@@ -539,7 +794,7 @@ def main() -> None:
     if removed:
         logger.info(f"Cleaned up {removed} orphaned files on startup.")
 
-    logger.info("Initializing YouTube to Telegram Music Downloader Bot...")
+    logger.info("Initializing TubeTapper Music Downloader Bot...")
     app = create_bot_app()
     logger.info("Bot is polling for updates. Press Ctrl+C to stop.")
     app.run_polling()

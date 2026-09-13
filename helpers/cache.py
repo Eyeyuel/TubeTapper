@@ -55,7 +55,7 @@ class AudioCacheManager:
         """Initializes SQLite database and tables for fallback caching."""
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
-                conn.execute(
+                conn.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS audio_cache (
                         video_id TEXT PRIMARY KEY,
@@ -64,7 +64,13 @@ class AudioCacheManager:
                         artist TEXT,
                         duration INTEGER,
                         created_at REAL
-                    )
+                    );
+                    CREATE TABLE IF NOT EXISTS user_settings (
+                        user_id INTEGER NOT NULL,
+                        setting_key TEXT NOT NULL,
+                        setting_value TEXT NOT NULL,
+                        PRIMARY KEY (user_id, setting_key)
+                    );
                     """
                 )
                 conn.commit()
@@ -257,6 +263,69 @@ class AudioCacheManager:
                     lock = self._local_locks.get(video_id)
                     if lock and lock.locked():
                         lock.release()
+
+    async def get_user_setting(
+        self, user_id: int, key: str, default: Optional[str] = None
+    ) -> Optional[str]:
+        """Gets a user preference setting (e.g., preferred audio format)."""
+        if not user_id or not key:
+            return default
+
+        # 1. Try Redis
+        if self._is_redis_active and self._redis_client:
+            try:
+                redis_key = f"tubetapper:user:{user_id}:{key}"
+                val = await self._redis_client.get(redis_key)
+                if val is not None:
+                    return val
+            except Exception as exc:
+                logger.debug(f"Redis get_user_setting error: {exc}")
+
+        # 2. Try SQLite
+        def _read_sqlite() -> Optional[str]:
+            try:
+                with sqlite3.connect(self.sqlite_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT setting_value FROM user_settings WHERE user_id = ? AND setting_key = ?",
+                        (user_id, key),
+                    )
+                    row = cursor.fetchone()
+                    return row[0] if row else default
+            except Exception:
+                return default
+
+        return await asyncio.to_thread(_read_sqlite)
+
+    async def set_user_setting(self, user_id: int, key: str, value: str) -> None:
+        """Saves a user preference setting to Redis and SQLite."""
+        if not user_id or not key:
+            return
+
+        # 1. Write to Redis
+        if self._is_redis_active and self._redis_client:
+            try:
+                redis_key = f"tubetapper:user:{user_id}:{key}"
+                await self._redis_client.set(redis_key, str(value))
+            except Exception as exc:
+                logger.debug(f"Redis set_user_setting error: {exc}")
+
+        # 2. Write to SQLite
+        def _write_sqlite() -> None:
+            try:
+                with sqlite3.connect(self.sqlite_path) as conn:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO user_settings (user_id, setting_key, setting_value)
+                        VALUES (?, ?, ?)
+                        """,
+                        (user_id, key, str(value)),
+                    )
+                    conn.commit()
+            except Exception as exc:
+                logger.debug(f"SQLite set_user_setting error: {exc}")
+
+        await asyncio.to_thread(_write_sqlite)
 
     async def close(self) -> None:
         """Closes Redis connections cleanly."""

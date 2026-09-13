@@ -28,6 +28,7 @@ class AppConfig:
     youtube_cookies_file: Optional[str] = None
     youtube_proxy: Optional[str] = None
     cache_ttl_days: int = 30
+    default_audio_format: str = "mp3"
     log_level: str = "INFO"
 
     @property
@@ -97,6 +98,9 @@ def load_config() -> AppConfig:
     except ValueError:
         cache_ttl = 30
 
+    raw_format = os.getenv("DEFAULT_AUDIO_FORMAT", "mp3").strip().lower()
+    default_format = "m4a" if raw_format == "m4a" else "mp3"
+
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
     return AppConfig(
@@ -111,6 +115,7 @@ def load_config() -> AppConfig:
         youtube_cookies_file=youtube_cookies_file,
         youtube_proxy=youtube_proxy,
         cache_ttl_days=cache_ttl,
+        default_audio_format=default_format,
         log_level=log_level,
     )
 

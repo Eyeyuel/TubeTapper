@@ -1,5 +1,6 @@
 """Tests for playlist detection, parsing, and streaming in downloader.py."""
 
+import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
@@ -185,3 +186,36 @@ async def test_stream_playlist_tracks_max_tracks_limit(downloader):
         assert results[0][0] == 1
         assert results[0][1] == 2  # Total capped to 2
         assert results[1][0] == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_playlist_pipelined_cancellation(downloader):
+    """Test pipelined streaming stops immediately when cancel_event is set."""
+    mock_playlist_info = {
+        "id": "PL_cancel",
+        "title": "Cancel Playlist",
+        "total_tracks": 5,
+        "tracks": [{"id": f"v{i}", "title": f"T{i}", "url": f"https://yt.com?v=v{i}"} for i in range(5)],
+    }
+
+    cancel_event = asyncio.Event()
+
+    def mock_download(url, output_dir=None, **kwargs):
+        return {"id": "test", "file_path": "/tmp/test.mp3", "title": "T", "artist": "A", "duration": 100, "thumbnail_path": None, "filesize": 1000, "exceeds_limit": False}
+
+    with patch.object(downloader, "get_playlist_info", return_value=mock_playlist_info), \
+         patch.object(downloader, "download_audio", side_effect=mock_download):
+
+        results = []
+        async for item in downloader.stream_playlist_pipelined(
+            "https://www.youtube.com/playlist?list=PL_cancel",
+            cancel_event=cancel_event,
+        ):
+            results.append(item)
+            if len(results) == 2:
+                # Cancel after 2 tracks
+                cancel_event.set()
+
+        # Should yield at most 2 or 3 items (buffered queue) and stop before reaching 5
+        assert len(results) < 5
+
