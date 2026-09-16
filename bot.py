@@ -189,10 +189,18 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     cache_engine = "Redis (In-Memory)" if cache_manager.is_redis_active else "SQLite (Fallback)"
+    bot_server_type = "Local Bot API Server (2GB)" if config.telegram_local_mode or config.telegram_api_server_url else "Telegram Public Gateway (50MB)"
+    mode_type = "Webhooks (High-Throughput)" if config.webhook_mode else "Long-Polling"
+    worker_status = "Distributed Worker Cluster" if config.worker_mode else f"In-Process Queue ({config.max_concurrent_downloads} workers)"
+    proxy_status = "Rotating Proxy Pool Active" if (config.youtube_proxy or config.youtube_proxy_pool) else "Direct Server IP"
 
     text = (
         "🟢 *Bot Status: Online*\n\n"
         "• Engine: `yt-dlp` + `FFmpeg`\n"
+        f"• Telegram Gateway: `{bot_server_type}`\n"
+        f"• Ingestion Mode: `{mode_type}`\n"
+        f"• Download Architecture: `{worker_status}`\n"
+        f"• Proxy Protection: `{proxy_status}`\n"
         f"• Audio Cache: `{cache_engine}`\n"
         f"• Concurrency Limit: `{config.max_concurrent_downloads} workers`\n"
         f"• Active Downloads: `{queue_manager.active_count}`\n"
@@ -317,7 +325,35 @@ async def handle_single_track(
         except Exception as exc:
             logger.warning(f"Failed to send cached audio: {exc}. Proceeding to fresh download.")
 
-    # 2. Concurrency-bounded download with queue notification
+    # 2. Distributed Worker Queue Dispatch (if WORKER_MODE is enabled)
+    if config.worker_mode and cache_manager.is_redis_active:
+        try:
+            from arq import create_pool
+            from arq.connections import RedisSettings
+
+            redis_pool = await create_pool(
+                RedisSettings.from_dsn(config.redis_url or "redis://localhost:6379/0")
+            )
+            await update_status_message(status_msg, "⏳ *Queued in high-speed worker pool...*")
+            await redis_pool.enqueue_job(
+                "process_download_job",
+                {
+                    "chat_id": chat_id,
+                    "url": url,
+                    "reply_to_message_id": reply_to,
+                    "audio_format": audio_format,
+                    "bitrate": bitrate,
+                    "status_message_id": status_msg.message_id if status_msg else None,
+                },
+            )
+            logger.info(f"Dispatched download for {url} to distributed worker queue.")
+            return
+        except Exception as exc:
+            logger.warning(
+                f"Could not dispatch to worker queue ({exc}). Falling back to in-process worker."
+            )
+
+    # 3. Concurrency-bounded download with queue notification (In-Process Fallback)
     async def notify_queue_position(pos: int) -> None:
         await update_status_message(
             status_msg,
@@ -799,13 +835,20 @@ def create_bot_app(token: Optional[str] = None) -> Application:
     if not bot_token or bot_token == "your_telegram_bot_token_here":
         bot_token = "TEST_TOKEN_FOR_INITIALIZATION"
 
-    application = (
+    builder = (
         ApplicationBuilder()
         .token(bot_token)
         .concurrent_updates(True)
         .post_init(on_startup)
-        .build()
     )
+
+    # If configured with local Telegram Bot API server, unlock 2GB uploads and LAN zero-copy transfer
+    if config.telegram_api_server_url:
+        builder = builder.base_url(config.telegram_api_server_url)
+    if config.telegram_local_mode:
+        builder = builder.local_mode(True)
+
+    application = builder.build()
 
     # Register command handlers with block=False for parallel execution
     application.add_handler(CommandHandler("start", start_command, block=False))
@@ -829,7 +872,7 @@ def create_bot_app(token: Optional[str] = None) -> Application:
 
 
 def main() -> None:
-    """Starts the bot in long-polling mode."""
+    """Starts the bot in webhook or long-polling mode."""
     if not config.bot_token or config.bot_token == "your_telegram_bot_token_here":
         logger.error(
             "Cannot start bot: TELEGRAM_BOT_TOKEN is not configured in .env. "
@@ -844,8 +887,21 @@ def main() -> None:
 
     logger.info("Initializing TubeTapper Music Downloader Bot...")
     app = create_bot_app()
-    logger.info("Bot is polling for updates. Press Ctrl+C to stop.")
-    app.run_polling()
+
+    # Support high-throughput Webhooks mode for 100k+ concurrent users
+    if config.webhook_mode and config.webhook_url:
+        logger.info(
+            f"Starting TubeTapper Bot in Webhook mode on port {config.webhook_port} ({config.webhook_url})..."
+        )
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=config.webhook_port,
+            webhook_url=config.webhook_url,
+            secret_token=config.webhook_secret,
+        )
+    else:
+        logger.info("Bot is polling for updates. Press Ctrl+C to stop.")
+        app.run_polling()
 
 
 if __name__ == "__main__":

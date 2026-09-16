@@ -11,6 +11,7 @@ import yt_dlp
 from config import AppConfig, config as global_config
 from helpers.artwork import embed_metadata_and_artwork_to_mp3, resolve_album_art
 from helpers.logger import setup_logger
+from helpers.proxy_manager import proxy_manager
 from helpers.title_cleaner import clean_music_title, parse_title_and_artist
 
 logger = setup_logger("downloader")
@@ -99,11 +100,12 @@ class AudioDownloader:
         return None
 
     def _apply_network_options(self, opts: Dict[str, Any]) -> Dict[str, Any]:
-        """Injects cookies file and proxy settings if configured."""
+        """Injects cookies file and rotating proxy settings if configured."""
         if self.config.youtube_cookies_file and Path(self.config.youtube_cookies_file).exists():
             opts["cookiefile"] = str(self.config.youtube_cookies_file)
-        if self.config.youtube_proxy:
-            opts["proxy"] = str(self.config.youtube_proxy)
+        active_proxy = proxy_manager.get_proxy() or self.config.youtube_proxy
+        if active_proxy:
+            opts["proxy"] = str(active_proxy)
         return opts
 
     def search_youtube(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:

@@ -30,6 +30,16 @@ class AppConfig:
     cache_ttl_days: int = 30
     default_audio_format: str = "mp3"
     log_level: str = "INFO"
+    telegram_api_server_url: Optional[str] = None
+    telegram_local_mode: bool = False
+    telegram_api_id: Optional[str] = None
+    telegram_api_hash: Optional[str] = None
+    webhook_mode: bool = False
+    webhook_url: Optional[str] = None
+    webhook_port: int = 8000
+    webhook_secret: Optional[str] = None
+    youtube_proxy_pool: Optional[str] = None
+    worker_mode: bool = False
 
     @property
     def max_file_size_bytes(self) -> int:
@@ -69,10 +79,19 @@ def load_config() -> AppConfig:
     except ValueError:
         bitrate = 192
 
+    # Local Telegram Bot API Server configurations (2GB file limit and LAN transfer)
+    raw_api_server = os.getenv("TELEGRAM_API_SERVER_URL", "").strip()
+    telegram_api_server_url = raw_api_server if raw_api_server else None
+
+    raw_local_mode = os.getenv("TELEGRAM_LOCAL_MODE", "").strip().lower()
+    telegram_local_mode = raw_local_mode in ("true", "1", "yes") or bool(telegram_api_server_url)
+
+    # If running with local Telegram Bot API server, default file size limit increases to 2000MB (2GB)
+    default_max_size = 2000 if telegram_local_mode else 50
     try:
-        max_size_mb = int(os.getenv("MAX_FILE_SIZE_MB", "50").strip())
+        max_size_mb = int(os.getenv("MAX_FILE_SIZE_MB", str(default_max_size)).strip())
     except ValueError:
-        max_size_mb = 50
+        max_size_mb = default_max_size
 
     try:
         max_playlist = int(os.getenv("MAX_PLAYLIST_TRACKS", "25").strip())
@@ -93,6 +112,9 @@ def load_config() -> AppConfig:
     raw_proxy = os.getenv("YOUTUBE_PROXY", "").strip()
     youtube_proxy = raw_proxy if raw_proxy else None
 
+    raw_proxy_pool = os.getenv("YOUTUBE_PROXY_POOL", "").strip()
+    youtube_proxy_pool = raw_proxy_pool if raw_proxy_pool else None
+
     try:
         cache_ttl = int(os.getenv("CACHE_TTL_DAYS", "30").strip())
     except ValueError:
@@ -102,6 +124,31 @@ def load_config() -> AppConfig:
     default_format = "m4a" if raw_format == "m4a" else "mp3"
 
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+
+    # Telegram API ID & Hash for local Bot API server registration
+    raw_api_id = os.getenv("TELEGRAM_API_ID", "").strip()
+    telegram_api_id = raw_api_id if raw_api_id else None
+
+    raw_api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
+    telegram_api_hash = raw_api_hash if raw_api_hash else None
+
+    # Webhook mode options
+    raw_webhook_mode = os.getenv("WEBHOOK_MODE", "false").strip().lower()
+    webhook_mode = raw_webhook_mode in ("true", "1", "yes")
+
+    raw_webhook_url = os.getenv("WEBHOOK_URL", "").strip()
+    webhook_url = raw_webhook_url if raw_webhook_url else None
+
+    try:
+        webhook_port = int(os.getenv("WEBHOOK_PORT", "8000").strip())
+    except ValueError:
+        webhook_port = 8000
+
+    raw_webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    webhook_secret = raw_webhook_secret if raw_webhook_secret else None
+
+    raw_worker_mode = os.getenv("WORKER_MODE", "false").strip().lower()
+    worker_mode = raw_worker_mode in ("true", "1", "yes")
 
     return AppConfig(
         bot_token=raw_token,
@@ -117,6 +164,16 @@ def load_config() -> AppConfig:
         cache_ttl_days=cache_ttl,
         default_audio_format=default_format,
         log_level=log_level,
+        telegram_api_server_url=telegram_api_server_url,
+        telegram_local_mode=telegram_local_mode,
+        telegram_api_id=telegram_api_id,
+        telegram_api_hash=telegram_api_hash,
+        webhook_mode=webhook_mode,
+        webhook_url=webhook_url,
+        webhook_port=webhook_port,
+        webhook_secret=webhook_secret,
+        youtube_proxy_pool=youtube_proxy_pool,
+        worker_mode=worker_mode,
     )
 
 

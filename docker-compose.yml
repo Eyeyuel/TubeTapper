@@ -17,6 +17,27 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Local C++ Telegram Bot API Server (Unlocks 2GB uploads and LAN zero-copy transfer)
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: tubetapper_bot_api
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID:-}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH:-}
+      - TELEGRAM_LOCAL=1
+      - TELEGRAM_STAT=1
+    volumes:
+      - downloads_data:/app/downloads
+      - telegram_bot_api_data:/var/lib/telegram-bot-api
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
   bot:
     build:
       context: .
@@ -31,7 +52,38 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - DOWNLOAD_DIR=/app/downloads
+      - TELEGRAM_API_SERVER_URL=${TELEGRAM_API_SERVER_URL:-}
     volumes:
+      - .:/app
+      - downloads_data:/app/downloads
+      # Optional: mount cookies.txt if available locally for YouTube bot bypass
+      # - ./cookies.txt:/app/cookies.txt:ro
+    ports:
+      - "8000:8000"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # Scalable distributed download worker cluster (Run: docker compose up -d --scale worker=5)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m arq worker.WorkerSettings
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DOWNLOAD_DIR=/app/downloads
+      - TELEGRAM_API_SERVER_URL=${TELEGRAM_API_SERVER_URL:-}
+    volumes:
+      - .:/app
       - downloads_data:/app/downloads
       # Optional: mount cookies.txt if available locally for YouTube bot bypass
       # - ./cookies.txt:/app/cookies.txt:ro
@@ -45,4 +97,6 @@ volumes:
   redis_data:
     driver: local
   downloads_data:
+    driver: local
+  telegram_bot_api_data:
     driver: local
