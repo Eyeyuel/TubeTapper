@@ -14,6 +14,7 @@ from typing import Any, AsyncGenerator, Dict, Optional, Union
 
 from config import config as global_config
 from helpers.logger import setup_logger
+from helpers.metrics import metrics
 
 logger = setup_logger("cache")
 
@@ -55,6 +56,8 @@ class AudioCacheManager:
         """Initializes SQLite database and tables for fallback caching."""
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=5000")
                 conn.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS audio_cache (
@@ -90,6 +93,8 @@ class AudioCacheManager:
                 decode_responses=True,
                 socket_timeout=2.0,
                 socket_connect_timeout=2.0,
+                max_connections=200,
+                retry_on_timeout=True,
             )
             await client.ping()
             self._redis_client = client
@@ -119,12 +124,18 @@ class AudioCacheManager:
                 raw = await self._redis_client.get(key)
                 if raw:
                     logger.debug(f"Redis cache HIT for {video_id}")
+                    metrics.increment("cache_hits")
                     return json.loads(raw)
             except Exception as exc:
                 logger.warning(f"Redis get error for {video_id}: {exc}. Checking SQLite...")
 
         # 2. SQLite fallback lookup
-        return await asyncio.to_thread(self._get_sqlite, video_id)
+        result = await asyncio.to_thread(self._get_sqlite, video_id)
+        if result is None:
+            metrics.increment("cache_misses")
+        else:
+            metrics.increment("cache_hits")
+        return result
 
     def _get_sqlite(self, video_id: str) -> Optional[Dict[str, Any]]:
         """Synchronous SQLite cache lookup with TTL verification."""

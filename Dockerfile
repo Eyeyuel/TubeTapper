@@ -31,8 +31,8 @@ RUN useradd -m -u 1000 appuser && \
 USER appuser
 
 # Health check to ensure python process is operational
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
-    CMD python3 -c "import sys; sys.exit(0)" || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=15s \
+    CMD python3 -c "import redis; r = redis.from_url('redis://redis:6379/0'); r.ping()" || exit 1
 
 # Start the bot
 CMD ["python", "bot.py"]

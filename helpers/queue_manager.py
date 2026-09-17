@@ -10,6 +10,7 @@ from typing import AsyncGenerator, Callable, Coroutine, Optional
 
 from config import config as global_config
 from helpers.logger import setup_logger
+from helpers.metrics import metrics
 
 logger = setup_logger("queue")
 
@@ -57,6 +58,7 @@ class DownloadQueueManager:
                 self._waiting_count += 1
                 queue_pos = self._waiting_count
                 is_queued = True
+                metrics.set_gauge("queue_depth", self._waiting_count)
                 logger.info(
                     f"Download queued: position #{queue_pos} (active: {self._active_count}/{self.max_concurrent})"
                 )
@@ -73,7 +75,9 @@ class DownloadQueueManager:
         async with self._lock:
             if is_queued:
                 self._waiting_count -= 1
+                metrics.set_gauge("queue_depth", self._waiting_count)
             self._active_count += 1
+            metrics.set_gauge("active_downloads", self._active_count)
             logger.debug(
                 f"Slot acquired (active: {self._active_count}/{self.max_concurrent}, waiting: {self._waiting_count})"
             )
@@ -83,6 +87,7 @@ class DownloadQueueManager:
         finally:
             async with self._lock:
                 self._active_count = max(0, self._active_count - 1)
+                metrics.set_gauge("active_downloads", self._active_count)
                 logger.debug(
                     f"Slot released (active: {self._active_count}/{self.max_concurrent}, waiting: {self._waiting_count})"
                 )

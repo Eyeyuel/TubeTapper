@@ -128,7 +128,71 @@ testAntigravity/
 │   └── test_safeguards.py  # Whitelist, 50MB guard & cleanup tests
 ├── deploy/
 │   └── youtube-bot.service # Systemd service unit file
+├── docker-compose.yml      # Multi-container orchestration
+├── monitoring/             # Prometheus & Grafana stack
 ├── requirements.txt        # Python package dependencies
 ├── .env.example            # Environment template
 └── .env                    # Active credentials
 ```
+
+---
+
+## 📈 Scaling for Production
+
+For handling up to 100,000+ users, use Docker Compose profiles to unlock horizontal scaling, webhooks, and the local Bot API server.
+
+1. **Local Telegram Bot API Server** (Removes 50MB limit -> 2GB):
+   ```bash
+   docker compose --profile local-api up -d
+   ```
+2. **High-Performance Nginx Webhook Mode**:
+   ```bash
+   docker compose --profile production up -d
+   ```
+3. **Distributed Worker Cluster** (Scale background downloaders via Redis ARQ):
+   ```bash
+   docker compose up -d --scale worker=10
+   ```
+4. **Monitoring & Observability**:
+   ```bash
+   docker compose --profile monitoring up -d
+   ```
+   *Access Grafana on port `3000` and Prometheus on port `9090`.*
+
+### Rotating Proxies
+To prevent IP bans from YouTube when running at scale, populate the proxy environment variables in `.env` or use `YOUTUBE_PROXY_POOL` to point to a text file containing one proxy URL per line.
+
+---
+
+## ⚙️ Configuration Reference
+
+### Core Settings
+- `TELEGRAM_BOT_TOKEN`: Your Telegram Bot API Token.
+- `ALLOWED_USERS`: Comma-separated list of numerical user IDs allowed to use the bot.
+- `DOWNLOAD_DIR`: Where ephemeral files are stored (default: `./downloads`).
+
+### Audio Settings
+- `AUDIO_BITRATE`: MP3 bitrate (default: `192`).
+- `DEFAULT_AUDIO_FORMAT`: `mp3` or `m4a`.
+- `MAX_FILE_SIZE_MB`: Max file size for upload (default: `50`).
+- `MAX_PLAYLIST_TRACKS`: Playlist track limit (default: `25`).
+
+### Cache & Distributed
+- `REDIS_URL`: Redis connection URL for cache and ARQ queue.
+- `CACHE_TTL_DAYS`: Cache expiry in days (default: `30`).
+- `MAX_CONCURRENT_DOWNLOADS`: Thread/worker limit (default: `5`).
+- `WORKER_MODE`: Set to `true` to enable distributed ARQ workers.
+- `TELEGRAM_LOCAL_MODE` & `TELEGRAM_API_SERVER_URL`: Enables 2GB upload limit.
+- `WEBHOOK_MODE`, `WEBHOOK_URL`, `WEBHOOK_PORT`, `WEBHOOK_SECRET`: Webhook config.
+
+### Proxy & Protection
+- `YOUTUBE_COOKIES_FILE`: Path to exported YouTube cookies.
+- `YOUTUBE_PROXY`: Single proxy URL.
+- `YOUTUBE_PROXY_POOL`: Path to a `.txt` file containing rotating proxies.
+
+### Rate Limiting & Logs
+- `USER_RATE_LIMIT`: Max requests per window.
+- `USER_RATE_WINDOW`: Sliding window seconds.
+- `LOG_LEVEL`: `INFO`, `DEBUG`, etc.
+- `LOG_FORMAT`: `colored` or `json`.
+

@@ -12,6 +12,8 @@ from downloader import AudioDownloader
 from helpers.cache import cache_manager
 from helpers.cleanup import cleanup_orphaned_downloads
 from helpers.logger import setup_logger
+from helpers.telegram_retry import send_with_retry
+from helpers.metrics import metrics
 
 logger = setup_logger("worker")
 
@@ -44,7 +46,8 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
         cached = await cache_manager.get(video_id)
         if cached and cached.get("file_id"):
             logger.info(f"[Worker] Instant cache delivery for {video_id} to chat {chat_id}")
-            await bot.send_audio(
+            await send_with_retry(
+                bot.send_audio,
                 chat_id=chat_id,
                 audio=cached["file_id"],
                 title=cached.get("title"),
@@ -112,7 +115,8 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
                 else None
             )
             try:
-                sent_msg = await bot.send_audio(
+                sent_msg = await send_with_retry(
+                    bot.send_audio,
                     chat_id=chat_id,
                     audio=audio_file,
                     title=track_data.get("title"),
@@ -174,6 +178,12 @@ async def shutdown(ctx: Dict[str, Any]) -> None:
     logger.info("Worker node shutdown cleanly.")
 
 
+async def on_job_error(ctx: Dict[str, Any], job_name: str, args: tuple, kwargs: dict, exc: Exception) -> None:
+    """Logs failed jobs and increments error metrics."""
+    logger.error(f"[Worker] Job '{job_name}' failed. Args: {args}, Kwargs: {kwargs}, Error: {exc}")
+    metrics.increment("worker_jobs_failed")
+
+
 # ARQ Worker Settings
 try:
     from arq.connections import RedisSettings
@@ -182,9 +192,12 @@ try:
         functions = [process_download_job]
         on_startup = startup
         on_shutdown = shutdown
+        on_job_error = on_job_error
         redis_settings = RedisSettings.from_dsn(config.redis_url or "redis://localhost:6379/0")
         max_jobs = config.max_concurrent_downloads
-        job_timeout = 600
+        job_timeout = 900
         keep_result = 60
+        retry_jobs = True
+        max_tries = 2
 except ImportError:
     WorkerSettings = None

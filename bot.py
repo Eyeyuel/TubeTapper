@@ -1,6 +1,7 @@
 """Telegram Bot application for YouTube to Telegram Music Downloader with safeguards and access control."""
 
 import asyncio
+from contextlib import nullcontext
 import os
 import re
 from functools import wraps
@@ -41,6 +42,16 @@ from helpers.progress import (
     update_status_message,
 )
 from helpers.queue_manager import queue_manager
+from helpers.rate_limiter import rate_limiter
+from helpers.telegram_retry import send_with_retry
+from helpers.metrics import metrics, start_metrics_server
+
+try:
+    from arq import create_pool
+    from arq.connections import RedisSettings
+    ARQ_AVAILABLE = True
+except ImportError:
+    ARQ_AVAILABLE = False
 
 logger = setup_logger("bot")
 
@@ -112,30 +123,49 @@ def build_cancel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def restricted(func: Callable) -> Callable:
-    """Decorator to enforce whitelist authorization if ALLOWED_USERS is set."""
+def restricted(func: Optional[Callable] = None, *, check_rate_limit: bool = True) -> Callable:
+    """Decorator to enforce whitelist authorization and per-user rate limiting."""
 
-    @wraps(func)
-    async def wrapped(
-        update: Update, context: ContextTypes.DEFAULT_TYPE, *args: Any, **kwargs: Any
-    ) -> Any:
-        user = update.effective_user
-        if user and not config.is_user_allowed(user.id):
-            logger.warning(
-                f"Unauthorized access attempt by user ID {user.id} (@{user.username or 'none'})"
-            )
-            if update.effective_message:
-                await update.effective_message.reply_text(
-                    "⛔ *Access Denied:*\nYou are not authorized to use this bot.",
-                    parse_mode="Markdown",
+    def decorator(f: Callable) -> Callable:
+        @wraps(f)
+        async def wrapped(
+            update: Update, context: ContextTypes.DEFAULT_TYPE, *args: Any, **kwargs: Any
+        ) -> Any:
+            user = update.effective_user
+            if user and not config.is_user_allowed(user.id):
+                logger.warning(
+                    f"Unauthorized access attempt by user ID {user.id} (@{user.username or 'none'})"
                 )
-            return None
-        return await func(update, context, *args, **kwargs)
+                if update.effective_message:
+                    await update.effective_message.reply_text(
+                        "⛔ *Access Denied:*\nYou are not authorized to use this bot.",
+                        parse_mode="Markdown",
+                    )
+                return None
 
-    return wrapped
+            if check_rate_limit and user:
+                if not rate_limiter.is_allowed(user.id):
+                    wait_time = rate_limiter.time_until_allowed(user.id)
+                    logger.warning(
+                        f"Rate limit exceeded for user ID {user.id} (retry in {wait_time:.1f}s)"
+                    )
+                    if update.effective_message:
+                        await update.effective_message.reply_text(
+                            f"⏳ *Rate limit reached.* Please wait {wait_time:.0f} seconds before your next request.",
+                            parse_mode="Markdown",
+                        )
+                    return None
+
+            return await f(update, context, *args, **kwargs)
+
+        return wrapped
+
+    if func is not None:
+        return decorator(func)
+    return decorator
 
 
-@restricted
+@restricted(check_rate_limit=False)
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message explaining bot usage."""
     if not update.effective_message:
@@ -156,7 +186,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
 
-@restricted
+@restricted(check_rate_limit=False)
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Provides user instructions, limitations, and help."""
     if not update.effective_message:
@@ -182,7 +212,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
 
-@restricted
+@restricted(check_rate_limit=False)
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Reports bot health, configuration, and status."""
     if not update.effective_message:
@@ -208,9 +238,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"• Max Upload Size: `{config.max_file_size_mb} MB`\n"
         f"• Default Audio Quality: `{config.audio_bitrate} kbps MP3`\n"
         "• Pipelined Streaming: `Enabled`\n"
-        "• Access Control: "
-        f"`{'Restricted' if config.allowed_users else 'Public'}`\n"
-        "• Ready to download audio!"
+        "• Ready to download audio!\n\n"
+        "📊 *Metrics:*\n"
+        f"```\n{metrics.get_summary()}\n```"
     )
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
@@ -303,6 +333,8 @@ async def handle_single_track(
 
     audio_format, bitrate = await get_user_audio_format(user_id)
 
+    metrics.increment("downloads_total")
+
     # 1. Instant Cache Check (Telegram file_id reuse)
     video_id = downloader.extract_video_id(url)
     if video_id:
@@ -310,9 +342,11 @@ async def handle_single_track(
             cached = await cache_manager.get(video_id)
             if cached and cached.get("file_id"):
                 logger.info(f"Delivering cached audio for video ID {video_id}")
+                metrics.increment("downloads_cached")
                 await update_status_message(status_msg, "⚡ *Found in cache! Delivering audio...*")
                 await send_upload_action(context, chat_id)
-                await context.bot.send_audio(
+                await send_with_retry(
+                    context.bot.send_audio,
                     chat_id=chat_id,
                     audio=cached["file_id"],
                     title=cached.get("title"),
@@ -325,116 +359,143 @@ async def handle_single_track(
         except Exception as exc:
             logger.warning(f"Failed to send cached audio: {exc}. Proceeding to fresh download.")
 
-    # 2. Distributed Worker Queue Dispatch (if WORKER_MODE is enabled)
-    if config.worker_mode and cache_manager.is_redis_active:
-        try:
-            from arq import create_pool
-            from arq.connections import RedisSettings
-
-            redis_pool = await create_pool(
-                RedisSettings.from_dsn(config.redis_url or "redis://localhost:6379/0")
-            )
-            await update_status_message(status_msg, "⏳ *Queued in high-speed worker pool...*")
-            await redis_pool.enqueue_job(
-                "process_download_job",
-                {
-                    "chat_id": chat_id,
-                    "url": url,
-                    "reply_to_message_id": reply_to,
-                    "audio_format": audio_format,
-                    "bitrate": bitrate,
-                    "status_message_id": status_msg.message_id if status_msg else None,
-                },
-            )
-            logger.info(f"Dispatched download for {url} to distributed worker queue.")
-            return
-        except Exception as exc:
-            logger.warning(
-                f"Could not dispatch to worker queue ({exc}). Falling back to in-process worker."
-            )
-
-    # 3. Concurrency-bounded download with queue notification (In-Process Fallback)
-    async def notify_queue_position(pos: int) -> None:
-        await update_status_message(
-            status_msg,
-            f"⏳ *Server download capacity reached.*\n"
-            f"• You are in queue: `#{pos}`\n"
-            f"• _Your download will start automatically once a slot opens!_",
-        )
-
-    async with queue_manager.acquire_slot(notify_callback=notify_queue_position):
-        await update_status_message(status_msg, "⬇️ *Downloading audio track...*")
-
-        try:
-            track_data = await asyncio.to_thread(
-                downloader.download_audio, url, None, audio_format, bitrate
-            )
-        except Exception as exc:
-            logger.error(f"Download error for {url}: {exc}")
-            await update_status_message(
-                status_msg, f"❌ *Download failed:*\n`{str(exc)[:150]}`"
-            )
-            return
-
-        # 50MB Telegram Upload Safeguard
-        if track_data.get("exceeds_limit"):
-            size_mb = track_data.get("filesize", 0) // (1024 * 1024)
-            downloader.cleanup_files(
-                track_data.get("file_path"), track_data.get("thumbnail_path")
-            )
-            await update_status_message(
-                status_msg,
-                f"⚠️ *File too large:* Audio file is {size_mb} MB, which exceeds "
-                f"Telegram's {config.max_file_size_mb} MB bot limit. Cannot upload.",
-            )
-            return
-
-        await update_status_message(status_msg, "📤 *Uploading audio to Telegram...*")
-        await send_upload_action(context, chat_id)
-
-        audio_path = track_data["file_path"]
-        thumb_path = track_data.get("thumbnail_path")
-
-        try:
-            with open(audio_path, "rb") as audio_file:
-                thumb_file = (
-                    open(thumb_path, "rb")
-                    if thumb_path and Path(thumb_path).exists()
-                    else None
-                )
-                try:
-                    sent_msg = await context.bot.send_audio(
+    # 2. Cache Stampede Protection (Distributed Lock)
+    lock_manager = cache_manager.acquire_lock(video_id) if video_id else nullcontext()
+    async with lock_manager:
+        # Re-check cache after acquiring lock in case another request completed while waiting
+        if video_id:
+            try:
+                cached = await cache_manager.get(video_id)
+                if cached and cached.get("file_id"):
+                    logger.info(f"Delivering cached audio (post-lock) for video ID {video_id}")
+                    metrics.increment("downloads_cached")
+                    await update_status_message(status_msg, "⚡ *Found in cache! Delivering audio...*")
+                    await send_upload_action(context, chat_id)
+                    await send_with_retry(
+                        context.bot.send_audio,
                         chat_id=chat_id,
-                        audio=audio_file,
-                        title=track_data.get("title"),
-                        performer=track_data.get("artist"),
-                        duration=track_data.get("duration"),
-                        thumbnail=thumb_file,
+                        audio=cached["file_id"],
+                        title=cached.get("title"),
+                        performer=cached.get("artist"),
+                        duration=cached.get("duration"),
                         reply_to_message_id=reply_to,
                     )
-                finally:
-                    if thumb_file:
-                        thumb_file.close()
+                    await safe_delete_message(status_msg)
+                    return
+            except Exception as exc:
+                logger.warning(f"Failed to send cached audio post-lock: {exc}. Proceeding to fresh download.")
 
-            # Save newly uploaded file_id into cache for instant delivery next time
-            if video_id and sent_msg and sent_msg.audio:
-                await cache_manager.set(
-                    video_id=video_id,
-                    file_id=sent_msg.audio.file_id,
-                    title=track_data.get("title"),
-                    artist=track_data.get("artist"),
-                    duration=track_data.get("duration"),
-                )
+        # 3. Distributed Worker Queue Dispatch (if WORKER_MODE is enabled)
+        if config.worker_mode and cache_manager.is_redis_active:
+            redis_pool = context.application.bot_data.get("arq_pool") if context and context.application else None
+            if redis_pool:
+                try:
+                    await update_status_message(status_msg, "⏳ *Queued in high-speed worker pool...*")
+                    await redis_pool.enqueue_job(
+                        "process_download_job",
+                        {
+                            "chat_id": chat_id,
+                            "url": url,
+                            "reply_to_message_id": reply_to,
+                            "audio_format": audio_format,
+                            "bitrate": bitrate,
+                            "status_message_id": status_msg.message_id if status_msg else None,
+                        },
+                    )
+                    logger.info(f"Dispatched download for {url} to distributed worker queue.")
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        f"Could not dispatch to worker queue ({exc}). Falling back to in-process worker."
+                    )
+            else:
+                logger.debug("Worker mode active but ARQ pool not initialized. Falling back to in-process worker.")
 
-            await safe_delete_message(status_msg)
-        except Exception as exc:
-            logger.error(f"Failed to upload audio to Telegram: {exc}")
+        # 4. Concurrency-bounded download with queue notification (In-Process Fallback)
+        async def notify_queue_position(pos: int) -> None:
             await update_status_message(
-                status_msg, f"❌ *Upload failed:*\n`{str(exc)[:150]}`"
+                status_msg,
+                f"⏳ *Server download capacity reached.*\n"
+                f"• You are in queue: `#{pos}`\n"
+                f"• _Your download will start automatically once a slot opens!_",
             )
-        finally:
-            downloader.cleanup_files(audio_path, thumb_path)
-            cleanup_orphaned_downloads(config.download_dir)
+
+        async with queue_manager.acquire_slot(notify_callback=notify_queue_position):
+            await update_status_message(status_msg, "⬇️ *Downloading audio track...*")
+
+            try:
+                track_data = await asyncio.to_thread(
+                    downloader.download_audio, url, None, audio_format, bitrate
+                )
+            except Exception as exc:
+                logger.error(f"Download error for {url}: {exc}")
+                metrics.increment("downloads_failed")
+                await update_status_message(
+                    status_msg, f"❌ *Download failed:*\n`{str(exc)[:150]}`"
+                )
+                return
+
+            # 50MB Telegram Upload Safeguard
+            if track_data.get("exceeds_limit"):
+                size_mb = track_data.get("filesize", 0) // (1024 * 1024)
+                downloader.cleanup_files(
+                    track_data.get("file_path"), track_data.get("thumbnail_path")
+                )
+                await update_status_message(
+                    status_msg,
+                    f"⚠️ *File too large:* Audio file is {size_mb} MB, which exceeds "
+                    f"Telegram's {config.max_file_size_mb} MB bot limit. Cannot upload.",
+                )
+                return
+
+            await update_status_message(status_msg, "📤 *Uploading audio to Telegram...*")
+            await send_upload_action(context, chat_id)
+
+            audio_path = track_data["file_path"]
+            thumb_path = track_data.get("thumbnail_path")
+
+            try:
+                with open(audio_path, "rb") as audio_file:
+                    thumb_file = (
+                        open(thumb_path, "rb")
+                        if thumb_path and Path(thumb_path).exists()
+                        else None
+                    )
+                    try:
+                        sent_msg = await send_with_retry(
+                            context.bot.send_audio,
+                            chat_id=chat_id,
+                            audio=audio_file,
+                            title=track_data.get("title"),
+                            performer=track_data.get("artist"),
+                            duration=track_data.get("duration"),
+                            thumbnail=thumb_file,
+                            reply_to_message_id=reply_to,
+                        )
+                    finally:
+                        if thumb_file:
+                            thumb_file.close()
+
+                # Save newly uploaded file_id into cache for instant delivery next time
+                if video_id and sent_msg and sent_msg.audio:
+                    await cache_manager.set(
+                        video_id=video_id,
+                        file_id=sent_msg.audio.file_id,
+                        title=track_data.get("title"),
+                        artist=track_data.get("artist"),
+                        duration=track_data.get("duration"),
+                    )
+
+                await safe_delete_message(status_msg)
+            except Exception as exc:
+                logger.error(f"Failed to upload audio to Telegram: {exc}")
+                metrics.increment("downloads_failed")
+                await update_status_message(
+                    status_msg, f"❌ *Upload failed:*\n`{str(exc)[:150]}`"
+                )
+            finally:
+                downloader.cleanup_files(audio_path, thumb_path)
+                cleanup_orphaned_downloads(config.download_dir)
 
 
 async def handle_playlist(
@@ -555,7 +616,8 @@ async def handle_playlist(
             if track_data.get("is_cached") and track_data.get("file_id"):
                 try:
                     await send_upload_action(context, chat_id)
-                    await context.bot.send_audio(
+                    await send_with_retry(
+                        context.bot.send_audio,
                         chat_id=chat_id,
                         audio=track_data["file_id"],
                         title=track_data.get("title"),
@@ -603,7 +665,8 @@ async def handle_playlist(
                         else None
                     )
                     try:
-                        sent_msg = await context.bot.send_audio(
+                        sent_msg = await send_with_retry(
+                            context.bot.send_audio,
                             chat_id=chat_id,
                             audio=audio_file,
                             title=track_data.get("title"),
@@ -809,8 +872,22 @@ BOT_COMMANDS = [
 
 
 async def on_startup(application: Application) -> None:
-    """Initializes async services and registers native Telegram onboarding screen & commands."""
+    """Initializes async resources, worker pools, and cache."""
+    start_metrics_server(9090)
     await cache_manager.initialize()
+
+    # Create shared ARQ worker pool if worker mode is active and Redis is reachable
+    if config.worker_mode and cache_manager.is_redis_active and ARQ_AVAILABLE:
+        try:
+            redis_pool = await create_pool(
+                RedisSettings.from_dsn(config.redis_url or "redis://localhost:6379/0")
+            )
+            application.bot_data["arq_pool"] = redis_pool
+            logger.info("Shared ARQ worker pool initialized in bot_data.")
+        except Exception as exc:
+            logger.warning(
+                f"Failed to create shared ARQ pool on startup ({exc}). In-process fallback will be used."
+            )
 
     # Configure Telegram native onboarding screen ("What can this bot do?") and menu commands
     try:
@@ -829,6 +906,15 @@ async def on_startup(application: Application) -> None:
         logger.debug(f"Could not set native Telegram descriptions (expected in offline/test mode): {exc}")
 
 
+async def on_shutdown(application: Application) -> None:
+    """Closes cache manager and ARQ pool on shutdown."""
+    await cache_manager.close()
+    pool = application.bot_data.get("arq_pool")
+    if pool:
+        await pool.close()
+    logger.info("Bot shutdown complete.")
+
+
 def create_bot_app(token: Optional[str] = None) -> Application:
     """Builds and returns the configured Telegram Application with concurrent update processing."""
     bot_token = token or config.bot_token
@@ -840,6 +926,7 @@ def create_bot_app(token: Optional[str] = None) -> Application:
         .token(bot_token)
         .concurrent_updates(True)
         .post_init(on_startup)
+        .post_shutdown(on_shutdown)
     )
 
     # If configured with local Telegram Bot API server, unlock 2GB uploads and LAN zero-copy transfer

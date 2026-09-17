@@ -7,76 +7,48 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import asyncio
 import httpx
 
 from helpers.logger import setup_logger
 
 logger = setup_logger("artwork")
 
-
-def crop_to_square_jpeg(source_input: str, output_path: Path) -> Optional[str]:
+async def crop_to_square_jpeg_async(source_input: str, output_path: Path) -> Optional[str]:
     """Crops an image or video/audio cover to a 1:1 centered square JPEG (320x320) for Telegram."""
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         is_url = str(source_input).startswith("http://") or str(source_input).startswith("https://")
 
-        # Fast memory buffer via HTTPX to avoid slow TLS handshake inside FFmpeg
         if is_url:
             try:
-                with httpx.Client(timeout=2.0, follow_redirects=True) as client:
-                    resp = client.get(str(source_input))
+                async with httpx.AsyncClient(timeout=2.0, follow_redirects=True) as client:
+                    resp = await client.get(str(source_input))
                     if resp.status_code == 200 and resp.content:
-                        cmd = [
-                            "ffmpeg",
-                            "-y",
-                            "-i",
-                            "pipe:0",
-                            "-an",
-                            "-vf",
-                            "crop=min(iw\\,ih):min(iw\\,ih),scale=320:320",
-                            "-frames:v",
-                            "1",
-                            "-update",
-                            "1",
-                            "-q:v",
-                            "2",
+                        proc = await asyncio.create_subprocess_exec(
+                            "ffmpeg", "-y", "-i", "pipe:0",
+                            "-an", "-vf", "crop=min(iw\\,ih):min(iw\\,ih),scale=320:320",
+                            "-frames:v", "1", "-update", "1", "-q:v", "2",
                             str(output_path),
-                        ]
-                        subprocess.run(
-                            cmd,
-                            input=resp.content,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            check=False,
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
                         )
+                        await proc.communicate(input=resp.content)
                         if output_path.exists() and output_path.stat().st_size > 0:
                             return str(output_path)
             except Exception as exc:
                 logger.debug(f"HTTP image fetch failed, falling back to direct ffmpeg input: {exc}")
 
-        # Center-crop local file to 1:1 square, then scale to 320x320 JPEG
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(source_input),
-            "-an",
-            "-vf",
-            "crop=min(iw\\,ih):min(iw\\,ih),scale=320:320",
-            "-frames:v",
-            "1",
-            "-update",
-            "1",
-            "-q:v",
-            "2",
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(source_input),
+            "-an", "-vf", "crop=min(iw\\,ih):min(iw\\,ih),scale=320:320",
+            "-frames:v", "1", "-update", "1", "-q:v", "2",
             str(output_path),
-        ]
-        subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
+        await proc.wait()
         if output_path.exists() and output_path.stat().st_size > 0:
             return str(output_path)
     except Exception as exc:
@@ -84,12 +56,7 @@ def crop_to_square_jpeg(source_input: str, output_path: Path) -> Optional[str]:
     return None
 
 
-def fetch_itunes_artwork(query: str, output_path: Path) -> Optional[Dict[str, str]]:
-    """Queries Apple iTunes Search API for official high-resolution square album cover art.
-
-    Returns:
-        Dict with keys: 'artwork_path', 'album', 'artist', 'title' or None
-    """
+async def fetch_itunes_artwork_async(query: str, output_path: Path) -> Optional[Dict[str, str]]:
     if not query:
         return None
 
@@ -98,19 +65,17 @@ def fetch_itunes_artwork(query: str, output_path: Path) -> Optional[Dict[str, st
             f"https://itunes.apple.com/search?term={urllib.parse.quote(query)}"
             "&entity=song&limit=1"
         )
-        with httpx.Client(timeout=1.5, follow_redirects=True) as client:
-            resp = client.get(url)
+        async with httpx.AsyncClient(timeout=1.5, follow_redirects=True) as client:
+            resp = await client.get(url)
             if resp.status_code == 200:
                 data = resp.json()
                 results = data.get("results", [])
                 if results:
                     item = results[0]
                     raw_art = item.get("artworkUrl100", "")
-                    # Upgrade to 600x600 high resolution cover art
                     hq_art = raw_art.replace("100x100bb", "600x600bb")
 
-                    # Download and scale to 320x320 JPEG
-                    thumb_res = crop_to_square_jpeg(hq_art, output_path)
+                    thumb_res = await crop_to_square_jpeg_async(hq_art, output_path)
                     if thumb_res:
                         logger.info(f"Fetched official iTunes cover art for: {query}")
                         return {
@@ -125,15 +90,14 @@ def fetch_itunes_artwork(query: str, output_path: Path) -> Optional[Dict[str, st
     return None
 
 
-def fetch_deezer_artwork(query: str, output_path: Path) -> Optional[Dict[str, str]]:
-    """Queries Deezer public search API for official square album cover art."""
+async def fetch_deezer_artwork_async(query: str, output_path: Path) -> Optional[Dict[str, str]]:
     if not query:
         return None
 
     try:
         url = f"https://api.deezer.com/search?q={urllib.parse.quote(query)}&limit=1"
-        with httpx.Client(timeout=1.5, follow_redirects=True) as client:
-            resp = client.get(url)
+        async with httpx.AsyncClient(timeout=1.5, follow_redirects=True) as client:
+            resp = await client.get(url)
             if resp.status_code == 200:
                 data = resp.json()
                 results = data.get("data", [])
@@ -146,7 +110,7 @@ def fetch_deezer_artwork(query: str, output_path: Path) -> Optional[Dict[str, st
                         or album.get("cover")
                     )
                     if art_url:
-                        thumb_res = crop_to_square_jpeg(art_url, output_path)
+                        thumb_res = await crop_to_square_jpeg_async(art_url, output_path)
                         if thumb_res:
                             logger.info(f"Fetched official Deezer cover art for: {query}")
                             return {
@@ -161,6 +125,58 @@ def fetch_deezer_artwork(query: str, output_path: Path) -> Optional[Dict[str, st
     return None
 
 
+async def _resolve_album_art_async(
+    artist: str,
+    song_name: str,
+    youtube_thumb_url: Optional[str],
+    mp3_path: Optional[Path],
+    output_thumb_path: Path,
+    fallback_thumb_path: Optional[Path] = None,
+) -> Optional[str]:
+    search_query = f"{artist} {song_name}".strip() if artist else song_name.strip()
+
+    if search_query:
+        # Run iTunes and Deezer requests concurrently
+        f_itunes = asyncio.create_task(fetch_itunes_artwork_async(search_query, output_thumb_path))
+        f_deezer = asyncio.create_task(fetch_deezer_artwork_async(search_query, output_thumb_path))
+        
+        # We wait for iTunes (first choice) up to 1.5s
+        try:
+            itunes_res = await asyncio.wait_for(f_itunes, timeout=1.5)
+            if itunes_res:
+                f_deezer.cancel()
+                return itunes_res["artwork_path"]
+        except (asyncio.TimeoutError, Exception) as exc:
+            logger.debug(f"iTunes artwork timeout or error: {exc}")
+
+        # If iTunes failed, wait for Deezer (fallback)
+        try:
+            deezer_res = await asyncio.wait_for(f_deezer, timeout=1.5)
+            if deezer_res:
+                return deezer_res["artwork_path"]
+        except (asyncio.TimeoutError, Exception) as exc:
+            logger.debug(f"Deezer artwork timeout or error: {exc}")
+
+    if fallback_thumb_path and Path(fallback_thumb_path).exists():
+        local_res = await crop_to_square_jpeg_async(str(fallback_thumb_path), output_thumb_path)
+        if local_res:
+            return local_res
+        return str(fallback_thumb_path)
+
+    if youtube_thumb_url:
+        yt_res = await crop_to_square_jpeg_async(youtube_thumb_url, output_thumb_path)
+        if yt_res:
+            logger.debug("Used YouTube thumbnail cropped to 1:1 square")
+            return yt_res
+
+    if mp3_path and mp3_path.exists():
+        mp3_res = await crop_to_square_jpeg_async(str(mp3_path), output_thumb_path)
+        if mp3_res:
+            logger.debug("Extracted and cropped embedded cover art to 1:1 square")
+            return mp3_res
+
+    return None
+
 def resolve_album_art(
     artist: str,
     song_name: str,
@@ -169,62 +185,9 @@ def resolve_album_art(
     output_thumb_path: Path,
     fallback_thumb_path: Optional[Path] = None,
 ) -> Optional[str]:
-    """Retrieves the best available square album art for a music track.
-
-    Strategy:
-        1. Query Apple iTunes and Deezer concurrently in parallel (max 1.5s timeout).
-        2. Fast local fallback thumbnail if present on disk (from yt-dlp, ~20ms).
-        3. Fallback: Take YouTube's thumbnail URL and crop to a 1:1 square.
-        4. Fallback: Embedded video stream from MP3 cropped to 1:1 square.
-    """
-    search_query = f"{artist} {song_name}".strip() if artist else song_name.strip()
-
-    # 1. Concurrent query to iTunes and Deezer
-    if search_query:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            f_itunes = executor.submit(fetch_itunes_artwork, search_query, output_thumb_path)
-            f_deezer = executor.submit(fetch_deezer_artwork, search_query, output_thumb_path)
-
-            itunes_res = None
-            try:
-                itunes_res = f_itunes.result(timeout=1.5)
-            except Exception as exc:
-                logger.debug(f"iTunes artwork timeout or error: {exc}")
-
-            if itunes_res:
-                return itunes_res["artwork_path"]
-
-            deezer_res = None
-            try:
-                deezer_res = f_deezer.result(timeout=0.5)
-            except Exception as exc:
-                logger.debug(f"Deezer artwork timeout or error: {exc}")
-
-            if deezer_res:
-                return deezer_res["artwork_path"]
-
-    # 2. Local fallback thumbnail if present on disk (zero network latency)
-    if fallback_thumb_path and Path(fallback_thumb_path).exists():
-        local_res = crop_to_square_jpeg(str(fallback_thumb_path), output_thumb_path)
-        if local_res:
-            return local_res
-        return str(fallback_thumb_path)
-
-    # 3. Fallback: YouTube thumbnail URL cropped to 1:1 square
-    if youtube_thumb_url:
-        yt_res = crop_to_square_jpeg(youtube_thumb_url, output_thumb_path)
-        if yt_res:
-            logger.debug("Used YouTube thumbnail cropped to 1:1 square")
-            return yt_res
-
-    # 4. Fallback: Embedded video stream from MP3 cropped to 1:1 square
-    if mp3_path and mp3_path.exists():
-        mp3_res = crop_to_square_jpeg(str(mp3_path), output_thumb_path)
-        if mp3_res:
-            logger.debug("Extracted and cropped embedded cover art to 1:1 square")
-            return mp3_res
-
-    return None
+    return asyncio.run(_resolve_album_art_async(
+        artist, song_name, youtube_thumb_url, mp3_path, output_thumb_path, fallback_thumb_path
+    ))
 
 
 def embed_metadata_and_artwork_to_mp3(

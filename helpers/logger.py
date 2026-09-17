@@ -1,5 +1,6 @@
 """Structured, colorized logger for the YouTube to Telegram Music Downloader Bot."""
 
+import json
 import logging
 import sys
 from typing import Optional
@@ -33,7 +34,22 @@ class ColoredFormatter(logging.Formatter):
         return formatter.format(record)
 
 
-def setup_logger(name: str = "yt_telegram_bot", level: Optional[str] = None) -> logging.Logger:
+class JSONFormatter(logging.Formatter):
+    """Structured JSON log formatter for production log aggregation."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
+
+
+def setup_logger(name: str = "yt_telegram_bot", level: Optional[str] = None, log_format: str = "colored") -> logging.Logger:
     """Sets up and returns a configured logger instance."""
     logger = logging.getLogger(name)
 
@@ -42,7 +58,10 @@ def setup_logger(name: str = "yt_telegram_bot", level: Optional[str] = None) -> 
         logger.setLevel(getattr(logging, log_level, logging.INFO))
 
         handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(ColoredFormatter())
+        if log_format == "json":
+            handler.setFormatter(JSONFormatter())
+        else:
+            handler.setFormatter(ColoredFormatter())
         logger.addHandler(handler)
         logger.propagate = False
 

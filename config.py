@@ -30,6 +30,7 @@ class AppConfig:
     cache_ttl_days: int = 30
     default_audio_format: str = "mp3"
     log_level: str = "INFO"
+    log_format: str = "colored"
     telegram_api_server_url: Optional[str] = None
     telegram_local_mode: bool = False
     telegram_api_id: Optional[str] = None
@@ -40,6 +41,8 @@ class AppConfig:
     webhook_secret: Optional[str] = None
     youtube_proxy_pool: Optional[str] = None
     worker_mode: bool = False
+    user_rate_limit: int = 5
+    user_rate_window: int = 60
 
     @property
     def max_file_size_bytes(self) -> int:
@@ -124,6 +127,7 @@ def load_config() -> AppConfig:
     default_format = "m4a" if raw_format == "m4a" else "mp3"
 
     log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    log_format = os.getenv("LOG_FORMAT", "colored").strip().lower()
 
     # Telegram API ID & Hash for local Bot API server registration
     raw_api_id = os.getenv("TELEGRAM_API_ID", "").strip()
@@ -150,6 +154,16 @@ def load_config() -> AppConfig:
     raw_worker_mode = os.getenv("WORKER_MODE", "false").strip().lower()
     worker_mode = raw_worker_mode in ("true", "1", "yes")
 
+    try:
+        user_rate_limit = int(os.getenv("USER_RATE_LIMIT", "5").strip())
+    except ValueError:
+        user_rate_limit = 5
+
+    try:
+        user_rate_window = int(os.getenv("USER_RATE_WINDOW", "60").strip())
+    except ValueError:
+        user_rate_window = 60
+
     return AppConfig(
         bot_token=raw_token,
         allowed_users=allowed_users,
@@ -164,6 +178,7 @@ def load_config() -> AppConfig:
         cache_ttl_days=cache_ttl,
         default_audio_format=default_format,
         log_level=log_level,
+        log_format=log_format,
         telegram_api_server_url=telegram_api_server_url,
         telegram_local_mode=telegram_local_mode,
         telegram_api_id=telegram_api_id,
@@ -174,12 +189,14 @@ def load_config() -> AppConfig:
         webhook_secret=webhook_secret,
         youtube_proxy_pool=youtube_proxy_pool,
         worker_mode=worker_mode,
+        user_rate_limit=user_rate_limit,
+        user_rate_window=user_rate_window,
     )
 
 
 # Global config instance
 config = load_config()
-logger = setup_logger(level=config.log_level)
+logger = setup_logger(level=config.log_level, log_format=config.log_format)
 
 # Issue an informative warning if the token is using the template placeholder
 if not config.bot_token or config.bot_token == "your_telegram_bot_token_here":

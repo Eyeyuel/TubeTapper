@@ -321,7 +321,12 @@ class AudioDownloader:
         bitrate: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Downloads audio stream, converts to MP3 or native M4A, embeds thumbnail, and returns metadata."""
-        target_dir = Path(output_dir).resolve() if output_dir else self.download_dir
+        if output_dir:
+            target_dir = Path(output_dir).resolve()
+        else:
+            import os
+            target_dir = self.download_dir / f"worker_{os.getpid()}"
+            
         target_dir.mkdir(parents=True, exist_ok=True)
 
         chosen_format = (audio_format or self.config.default_audio_format).lower()
@@ -357,7 +362,7 @@ class AudioDownloader:
             "outtmpl": outtmpl,
             "postprocessors": postprocessors,
             "writethumbnail": True,
-            "concurrent_fragment_downloads": 4,
+            "concurrent_fragment_downloads": 2,
             "buffersize": 1024 * 64,
             "quiet": True,
             "no_warnings": True,
