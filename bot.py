@@ -95,11 +95,13 @@ def build_settings_keyboard(current_pref: str) -> InlineKeyboardMarkup:
     b1_check = " ✅" if current_pref == "mp3_192" else ""
     b2_check = " ✅" if current_pref == "mp3_320" else ""
     b3_check = " ✅" if current_pref == "m4a" else ""
+    b4_check = " ✅" if current_pref == "mp4" else ""
 
     keyboard = [
         [InlineKeyboardButton(f"🎵 MP3 - 192 kbps (Standard){b1_check}", callback_data="set_fmt:mp3_192")],
         [InlineKeyboardButton(f"🎧 MP3 - 320 kbps (High Quality){b2_check}", callback_data="set_fmt:mp3_320")],
         [InlineKeyboardButton(f"⚡ M4A - Native Source Copy (Fastest){b3_check}", callback_data="set_fmt:m4a")],
+        [InlineKeyboardButton(f"🎬 Video - MP4 / Shorts{b4_check}", callback_data="set_fmt:mp4")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -143,7 +145,14 @@ def restricted(func: Optional[Callable] = None, *, check_rate_limit: bool = True
                     )
                 return None
 
-            if check_rate_limit and user:
+            # Exempt UI buttons like settings and cancel from rate limiting
+            exempt_from_rate_limit = False
+            if update.callback_query and update.callback_query.data:
+                cb_data = update.callback_query.data
+                if cb_data.startswith("set_fmt:") or cb_data.startswith("cancel_pl:"):
+                    exempt_from_rate_limit = True
+
+            if check_rate_limit and user and not exempt_from_rate_limit:
                 if not rate_limiter.is_allowed(user.id):
                     wait_time = rate_limiter.time_until_allowed(user.id)
                     logger.warning(
@@ -333,6 +342,10 @@ async def handle_single_track(
     user_id = update.effective_user.id if update.effective_user else 0
 
     audio_format, bitrate = await get_user_audio_format(user_id)
+    
+    # Auto-detect Shorts and default to Video format for better UX
+    if "/shorts/" in url.lower():
+        audio_format = "mp4"
 
     metrics.increment("downloads_total")
 
@@ -340,21 +353,28 @@ async def handle_single_track(
     video_id = downloader.extract_video_id(url)
     if video_id:
         try:
-            cached = await cache_manager.get(video_id)
+            cached = await cache_manager.get(video_id, audio_format)
             if cached and cached.get("file_id"):
                 logger.info(f"Delivering cached audio for video ID {video_id}")
                 metrics.increment("downloads_cached")
                 await update_status_message(status_msg, "⚡ *Found in cache! Delivering audio...*")
                 await send_upload_action(context, chat_id)
-                await send_with_retry(
-                    context.bot.send_audio,
-                    chat_id=chat_id,
-                    audio=cached["file_id"],
-                    title=cached.get("title"),
-                    performer=cached.get("artist"),
-                    duration=cached.get("duration"),
-                    reply_to_message_id=reply_to,
-                )
+                is_video = audio_format == "mp4"
+                send_func = context.bot.send_video if is_video else context.bot.send_audio
+                kwargs = {
+                    "chat_id": chat_id,
+                    "duration": cached.get("duration"),
+                    "reply_to_message_id": reply_to,
+                }
+                if is_video:
+                    kwargs["video"] = cached["file_id"]
+                    kwargs["caption"] = f"{cached.get('title')} - {cached.get('artist')}"
+                else:
+                    kwargs["audio"] = cached["file_id"]
+                    kwargs["title"] = cached.get("title")
+                    kwargs["performer"] = cached.get("artist")
+
+                await send_with_retry(send_func, **kwargs)
                 await safe_delete_message(status_msg)
                 return
         except Exception as exc:
@@ -366,21 +386,28 @@ async def handle_single_track(
         # Re-check cache after acquiring lock in case another request completed while waiting
         if video_id:
             try:
-                cached = await cache_manager.get(video_id)
+                cached = await cache_manager.get(video_id, audio_format)
                 if cached and cached.get("file_id"):
                     logger.info(f"Delivering cached audio (post-lock) for video ID {video_id}")
                     metrics.increment("downloads_cached")
                     await update_status_message(status_msg, "⚡ *Found in cache! Delivering audio...*")
                     await send_upload_action(context, chat_id)
-                    await send_with_retry(
-                        context.bot.send_audio,
-                        chat_id=chat_id,
-                        audio=cached["file_id"],
-                        title=cached.get("title"),
-                        performer=cached.get("artist"),
-                        duration=cached.get("duration"),
-                        reply_to_message_id=reply_to,
-                    )
+                    is_video = audio_format == "mp4"
+                    send_func = context.bot.send_video if is_video else context.bot.send_audio
+                    kwargs = {
+                        "chat_id": chat_id,
+                        "duration": cached.get("duration"),
+                        "reply_to_message_id": reply_to,
+                    }
+                    if is_video:
+                        kwargs["video"] = cached["file_id"]
+                        kwargs["caption"] = f"{cached.get('title')} - {cached.get('artist')}"
+                    else:
+                        kwargs["audio"] = cached["file_id"]
+                        kwargs["title"] = cached.get("title")
+                        kwargs["performer"] = cached.get("artist")
+
+                    await send_with_retry(send_func, **kwargs)
                     await safe_delete_message(status_msg)
                     return
             except Exception as exc:
@@ -422,7 +449,8 @@ async def handle_single_track(
             )
 
         async with queue_manager.acquire_slot(notify_callback=notify_queue_position):
-            await update_status_message(status_msg, "⬇️ *Downloading audio track...*")
+            media_type = "video" if audio_format == "mp4" else "audio track"
+            await update_status_message(status_msg, f"⬇️ *Downloading {media_type}...*")
 
             try:
                 track_data = await asyncio.to_thread(
@@ -463,28 +491,39 @@ async def handle_single_track(
                         else None
                     )
                     try:
-                        sent_msg = await send_with_retry(
-                            context.bot.send_audio,
-                            chat_id=chat_id,
-                            audio=audio_file,
-                            title=track_data.get("title"),
-                            performer=track_data.get("artist"),
-                            duration=track_data.get("duration"),
-                            thumbnail=thumb_file,
-                            reply_to_message_id=reply_to,
-                        )
+                        is_video = audio_format == "mp4"
+                        send_func = context.bot.send_video if is_video else context.bot.send_audio
+                        kwargs = {
+                            "chat_id": chat_id,
+                            "duration": track_data.get("duration"),
+                            "reply_to_message_id": reply_to,
+                        }
+                        if is_video:
+                            kwargs["video"] = audio_file
+                            kwargs["caption"] = f"{track_data.get('title')} - {track_data.get('artist')}"
+                        else:
+                            kwargs["audio"] = audio_file
+                            kwargs["title"] = track_data.get("title")
+                            kwargs["performer"] = track_data.get("artist")
+
+                        if thumb_file:
+                            kwargs["thumbnail"] = thumb_file
+
+                        sent_msg = await send_with_retry(send_func, **kwargs)
                     finally:
                         if thumb_file:
                             thumb_file.close()
 
                 # Save newly uploaded file_id into cache for instant delivery next time
-                if video_id and sent_msg and sent_msg.audio:
+                if video_id and sent_msg and (sent_msg.audio or sent_msg.video):
+                    file_id = sent_msg.video.file_id if sent_msg.video else sent_msg.audio.file_id
                     await cache_manager.set(
                         video_id=video_id,
-                        file_id=sent_msg.audio.file_id,
+                        file_id=file_id,
                         title=track_data.get("title"),
                         artist=track_data.get("artist"),
                         duration=track_data.get("duration"),
+                        format_id=audio_format,
                     )
 
                 await safe_delete_message(status_msg)
@@ -617,14 +656,21 @@ async def handle_playlist(
             if track_data.get("is_cached") and track_data.get("file_id"):
                 try:
                     await send_upload_action(context, chat_id)
-                    await send_with_retry(
-                        context.bot.send_audio,
-                        chat_id=chat_id,
-                        audio=track_data["file_id"],
-                        title=track_data.get("title"),
-                        performer=track_data.get("artist"),
-                        duration=track_data.get("duration"),
-                    )
+                    is_video = audio_format == "mp4"
+                    send_func = context.bot.send_video if is_video else context.bot.send_audio
+                    kwargs = {
+                        "chat_id": chat_id,
+                        "duration": track_data.get("duration"),
+                    }
+                    if is_video:
+                        kwargs["video"] = track_data["file_id"]
+                        kwargs["caption"] = f"{track_data.get('title')} - {track_data.get('artist')}"
+                    else:
+                        kwargs["audio"] = track_data["file_id"]
+                        kwargs["title"] = track_data.get("title")
+                        kwargs["performer"] = track_data.get("artist")
+
+                    await send_with_retry(send_func, **kwargs)
                     sent_count += 1
                     if index < total_tracks and not cancel_event.is_set():
                         status_msg = await repost_status_message(
@@ -666,15 +712,24 @@ async def handle_playlist(
                         else None
                     )
                     try:
-                        sent_msg = await send_with_retry(
-                            context.bot.send_audio,
-                            chat_id=chat_id,
-                            audio=audio_file,
-                            title=track_data.get("title"),
-                            performer=track_data.get("artist"),
-                            duration=track_data.get("duration"),
-                            thumbnail=thumb_file,
-                        )
+                        is_video = audio_format == "mp4"
+                        send_func = context.bot.send_video if is_video else context.bot.send_audio
+                        kwargs = {
+                            "chat_id": chat_id,
+                            "duration": track_data.get("duration"),
+                        }
+                        if is_video:
+                            kwargs["video"] = audio_file
+                            kwargs["caption"] = f"{track_data.get('title')} - {track_data.get('artist')}"
+                        else:
+                            kwargs["audio"] = audio_file
+                            kwargs["title"] = track_data.get("title")
+                            kwargs["performer"] = track_data.get("artist")
+
+                        if thumb_file:
+                            kwargs["thumbnail"] = thumb_file
+
+                        sent_msg = await send_with_retry(send_func, **kwargs)
                         sent_count += 1
                     finally:
                         if thumb_file:
@@ -682,13 +737,15 @@ async def handle_playlist(
 
                 # Cache the newly uploaded track
                 track_id = track_data.get("id")
-                if track_id and sent_msg and sent_msg.audio:
+                if track_id and sent_msg and (sent_msg.audio or sent_msg.video):
+                    file_id = sent_msg.video.file_id if sent_msg.video else sent_msg.audio.file_id
                     await cache_manager.set(
                         video_id=track_id,
-                        file_id=sent_msg.audio.file_id,
+                        file_id=file_id,
                         title=track_data.get("title"),
                         artist=track_data.get("artist"),
                         duration=track_data.get("duration"),
+                        format_id=audio_format,
                     )
 
                 # Reposition the live progress dashboard below the newly uploaded audio track
@@ -781,6 +838,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             "mp3_192": "MP3 (192 kbps)",
             "mp3_320": "MP3 (320 kbps)",
             "m4a": "M4A (Native Source Copy)",
+            "mp4": "MP4 (Video / Shorts)",
         }
         name = fmt_names.get(chosen_fmt, chosen_fmt)
         try:

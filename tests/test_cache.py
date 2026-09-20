@@ -99,7 +99,7 @@ async def test_redis_cache_operations(tmp_path):
         cached = await cache.get("vid_redis_1")
         assert cached is not None
         assert cached["file_id"] == "REDIS_FILE"
-        mock_redis.get.assert_called_once_with("tubetapper:cache:audio:vid_redis_1")
+        mock_redis.get.assert_called_once_with("tubetapper:cache:audio:vid_redis_1_mp3")
 
         # Test SET
         await cache.set("vid_redis_2", file_id="NEW_FILE", title="New Title")
@@ -108,7 +108,7 @@ async def test_redis_cache_operations(tmp_path):
         # Test Lock
         async with cache.acquire_lock("vid_redis_lock"):
             pass
-        mock_redis.delete.assert_called_once_with("tubetapper:lock:audio:vid_redis_lock")
+        mock_redis.delete.assert_called_once_with("tubetapper:lock:audio:vid_redis_lock_mp3")
 
         await cache.close()
         assert not cache.is_redis_active

@@ -112,15 +112,17 @@ class AudioCacheManager:
         """Returns True if connected to an active Redis instance."""
         return self._is_redis_active
 
-    async def get(self, video_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieves cached track info (file_id, metadata) by YouTube video ID."""
+    async def get(self, video_id: str, format_id: str = "mp3") -> Optional[Dict[str, Any]]:
+        """Retrieves cached track info (file_id, metadata) by YouTube video ID and format."""
         if not video_id:
             return None
+
+        cache_key = f"{video_id}_{format_id}"
 
         # 1. Attempt Redis lookup
         if self._is_redis_active and self._redis_client:
             try:
-                key = f"tubetapper:cache:audio:{video_id}"
+                key = f"tubetapper:cache:audio:{cache_key}"
                 raw = await self._redis_client.get(key)
                 if raw:
                     logger.debug(f"Redis cache HIT for {video_id}")
@@ -130,7 +132,7 @@ class AudioCacheManager:
                 logger.warning(f"Redis get error for {video_id}: {exc}. Checking SQLite...")
 
         # 2. SQLite fallback lookup
-        result = await asyncio.to_thread(self._get_sqlite, video_id)
+        result = await asyncio.to_thread(self._get_sqlite, cache_key)
         if result is None:
             metrics.increment("cache_misses")
         else:
@@ -176,10 +178,13 @@ class AudioCacheManager:
         title: Optional[str] = None,
         artist: Optional[str] = None,
         duration: Optional[int] = None,
+        format_id: str = "mp3",
     ) -> None:
         """Saves a track's Telegram file_id and metadata to cache."""
         if not video_id or not file_id:
             return
+
+        cache_key = f"{video_id}_{format_id}"
 
         now = time.time()
         record = {
@@ -193,14 +198,14 @@ class AudioCacheManager:
         # 1. Attempt Redis write
         if self._is_redis_active and self._redis_client:
             try:
-                key = f"tubetapper:cache:audio:{video_id}"
+                key = f"tubetapper:cache:audio:{cache_key}"
                 await self._redis_client.set(key, json.dumps(record), ex=self.ttl_seconds)
-                logger.debug(f"Saved {video_id} to Redis cache.")
+                logger.debug(f"Saved {cache_key} to Redis cache.")
             except Exception as exc:
-                logger.warning(f"Redis set error for {video_id}: {exc}. Writing to SQLite fallback...")
+                logger.warning(f"Redis set error for {cache_key}: {exc}. Writing to SQLite fallback...")
 
         # 2. Always persist to SQLite fallback as well for durability
-        await asyncio.to_thread(self._set_sqlite, video_id, record)
+        await asyncio.to_thread(self._set_sqlite, cache_key, record)
 
     def _set_sqlite(self, video_id: str, record: Dict[str, Any]) -> None:
         """Synchronous SQLite cache write."""
@@ -227,14 +232,15 @@ class AudioCacheManager:
 
     @asynccontextmanager
     async def acquire_lock(
-        self, video_id: str, timeout: int = 120
+        self, video_id: str, format_id: str = "mp3", timeout: int = 120
     ) -> AsyncGenerator[bool, None]:
         """Distributed lock context manager to protect against cache stampedes.
 
         If multiple users request the exact same video concurrently, one acquires the lock
         and downloads, while subsequent users wait and then retrieve the cached file_id.
         """
-        lock_key = f"tubetapper:lock:audio:{video_id}"
+        cache_key = f"{video_id}_{format_id}"
+        lock_key = f"tubetapper:lock:audio:{cache_key}"
         acquired = False
 
         if self._is_redis_active and self._redis_client:
@@ -245,7 +251,7 @@ class AudioCacheManager:
                     # Wait up to 15s to see if the other worker finishes downloading
                     for _ in range(15):
                         await asyncio.sleep(1.0)
-                        cached = await self.get(video_id)
+                        cached = await self.get(video_id, format_id)
                         if cached:
                             break
             except Exception as exc:

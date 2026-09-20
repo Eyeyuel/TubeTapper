@@ -43,18 +43,25 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
     # 1. Check cache first
     video_id = downloader.extract_video_id(url)
     if video_id:
-        cached = await cache_manager.get(video_id)
+        cached = await cache_manager.get(video_id, audio_format)
         if cached and cached.get("file_id"):
             logger.info(f"[Worker] Instant cache delivery for {video_id} to chat {chat_id}")
-            await send_with_retry(
-                bot.send_audio,
-                chat_id=chat_id,
-                audio=cached["file_id"],
-                title=cached.get("title"),
-                performer=cached.get("artist"),
-                duration=cached.get("duration"),
-                reply_to_message_id=reply_to,
-            )
+            is_video = audio_format == "mp4"
+            send_func = bot.send_video if is_video else bot.send_audio
+            kwargs = {
+                "chat_id": chat_id,
+                "duration": cached.get("duration"),
+                "reply_to_message_id": reply_to,
+            }
+            if is_video:
+                kwargs["video"] = cached["file_id"]
+                kwargs["caption"] = f"{cached.get('title')} - {cached.get('artist')}"
+            else:
+                kwargs["audio"] = cached["file_id"]
+                kwargs["title"] = cached.get("title")
+                kwargs["performer"] = cached.get("artist")
+
+            await send_with_retry(send_func, **kwargs)
             if status_msg_id:
                 try:
                     await bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
@@ -104,7 +111,8 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
 
     try:
         try:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VOICE)
+            action = ChatAction.UPLOAD_VIDEO if audio_format == "mp4" else ChatAction.UPLOAD_VOICE
+            await bot.send_chat_action(chat_id=chat_id, action=action)
         except Exception:
             pass
 
@@ -115,25 +123,35 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
                 else None
             )
             try:
-                sent_msg = await send_with_retry(
-                    bot.send_audio,
-                    chat_id=chat_id,
-                    audio=audio_file,
-                    title=track_data.get("title"),
-                    performer=track_data.get("artist"),
-                    duration=track_data.get("duration"),
-                    thumbnail=thumb_file,
-                    reply_to_message_id=reply_to,
-                )
+                is_video = audio_format == "mp4"
+                send_func = bot.send_video if is_video else bot.send_audio
+                kwargs = {
+                    "chat_id": chat_id,
+                    "duration": track_data.get("duration"),
+                    "reply_to_message_id": reply_to,
+                }
+                if is_video:
+                    kwargs["video"] = audio_file
+                    kwargs["caption"] = f"{track_data.get('title')} - {track_data.get('artist')}"
+                else:
+                    kwargs["audio"] = audio_file
+                    kwargs["title"] = track_data.get("title")
+                    kwargs["performer"] = track_data.get("artist")
+
+                if thumb_file:
+                    kwargs["thumbnail"] = thumb_file
+
+                sent_msg = await send_with_retry(send_func, **kwargs)
             finally:
                 if thumb_file:
                     thumb_file.close()
 
         # Cache file_id
-        if video_id and sent_msg and sent_msg.audio:
+        if video_id and sent_msg and (sent_msg.audio or sent_msg.video):
+            file_id = sent_msg.video.file_id if sent_msg.video else sent_msg.audio.file_id
             await cache_manager.set(
                 video_id=video_id,
-                file_id=sent_msg.audio.file_id,
+                file_id=file_id,
                 title=track_data.get("title"),
                 artist=track_data.get("artist"),
                 duration=track_data.get("duration"),

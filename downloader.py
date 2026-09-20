@@ -345,6 +345,10 @@ class AudioDownloader:
             ]
             format_spec = "ba[ext=m4a]/bestaudio/best"
             target_ext = "m4a"
+        elif chosen_format == "mp4":
+            target_ext = "mp4"
+            postprocessors = []
+            format_spec = "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"
         else:
             # Universal MP3 conversion at configured bitrate
             postprocessors = [
@@ -489,7 +493,8 @@ class AudioDownloader:
             track_id = track.get("id") or self.extract_video_id(track_url)
             if cache_manager and track_id:
                 try:
-                    cached = await cache_manager.get(track_id)
+                    fmt = audio_format or self.config.default_audio_format
+                    cached = await cache_manager.get(track_id, fmt)
                     if cached:
                         yield (
                             index,
@@ -563,7 +568,8 @@ class AudioDownloader:
                 track_id = track.get("id") or self.extract_video_id(track_url)
                 if cache_manager and track_id:
                     try:
-                        cached = await cache_manager.get(track_id)
+                        fmt = audio_format or self.config.default_audio_format
+                        cached = await cache_manager.get(track_id, fmt)
                         if cached:
                             await queue.put(
                                 (

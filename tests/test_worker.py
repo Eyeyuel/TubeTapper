@@ -63,6 +63,7 @@ async def test_process_download_job_fresh_download(tmp_path):
     mock_bot = MagicMock()
     mock_audio_msg = MagicMock()
     mock_audio_msg.audio.file_id = "NEW_WORKER_FILE_ID"
+    mock_audio_msg.video = None
     mock_bot.send_audio = AsyncMock(return_value=mock_audio_msg)
     mock_bot.delete_message = AsyncMock()
     mock_bot.send_chat_action = AsyncMock()

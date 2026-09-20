@@ -52,6 +52,7 @@ async def test_restricted_decorator_blocks_rate_limited_user():
 
     mock_update = MagicMock()
     mock_update.effective_user.id = 88888
+    mock_update.callback_query = None
     mock_update.effective_message.reply_text = AsyncMock()
     mock_context = MagicMock()
 
