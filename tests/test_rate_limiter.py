@@ -65,7 +65,7 @@ async def test_restricted_decorator_blocks_rate_limited_user():
     assert result is None
     mock_func.assert_not_called()
     mock_update.effective_message.reply_text.assert_called_once()
-    assert "Rate limit reached" in mock_update.effective_message.reply_text.call_args[0][0]
+    assert "going a bit too fast" in mock_update.effective_message.reply_text.call_args[0][0]
 
     # Clean up
     rate_limiter.reset(88888)

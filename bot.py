@@ -138,7 +138,7 @@ def restricted(func: Optional[Callable] = None, *, check_rate_limit: bool = True
                 )
                 if update.effective_message:
                     await update.effective_message.reply_text(
-                        "⛔ *Access Denied:*\nYou are not authorized to use this bot.",
+                        "👋 *Sorry, this bot is currently private and you don't have access.*",
                         parse_mode="Markdown",
                     )
                 return None
@@ -151,7 +151,7 @@ def restricted(func: Optional[Callable] = None, *, check_rate_limit: bool = True
                     )
                     if update.effective_message:
                         await update.effective_message.reply_text(
-                            f"⏳ *Rate limit reached.* Please wait {wait_time:.0f} seconds before your next request.",
+                            f"🏎️ *Whoa there, you're going a bit too fast!* Please wait {wait_time:.0f} seconds before requesting another song.",
                             parse_mode="Markdown",
                         )
                     return None
@@ -173,17 +173,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     text = (
         "🎵 *Welcome to TubeTapper Music Downloader!* 🎧\n\n"
-        "Send me any YouTube link or just type a song name to search directly!\n\n"
-        "📌 *Features & Usage:*\n"
-        "• *Direct Search:* Type any song name (e.g. `Blinding Lights The Weeknd`)\n"
-        "• *Single Video:* `https://youtu.be/...` or `https://www.youtube.com/watch?v=...`\n"
-        "• *Full Playlist:* `https://www.youtube.com/playlist?list=...`\n"
-        "• *Radio Mix:* `https://www.youtube.com/watch?v=...&list=RD...`\n"
-        "• *Audio Quality:* Type /settings to choose MP3 (192k/320k) or Native M4A\n\n"
-        "💡 _Tip: During playlist downloads, you can tap [❌ Cancel Download] at any time!_\n\n"
-        "Send a link or song name now, or type /help for details."
+        "Just paste a YouTube link here, or type the name of a song to search for it!\n\n"
+        "> 💡 *Tip:* You can cancel playlist downloads at any time if they're too long."
     )
-    await update.effective_message.reply_text(text, parse_mode="Markdown")
+    keyboard = [
+        [
+            InlineKeyboardButton("⚙️ Settings", callback_data="cmd_settings"),
+            InlineKeyboardButton("🆘 Help", callback_data="cmd_help"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
 
 @restricted(check_rate_limit=False)
@@ -194,20 +194,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = (
         "ℹ️ *How to Use This Bot:*\n\n"
-        "1️⃣ *Search directly:* Just type any song or artist name (e.g. `/search Queen` or `Queen Bohemian Rhapsody`).\n"
-        "2️⃣ *Or paste a link:* Send any YouTube video, playlist, or mix URL.\n"
-        "3️⃣ *Choose audio quality:* Use /settings to switch between MP3 192k, MP3 320k, and Native M4A.\n\n"
-        "💡 *Important Note on YouTube Mixes (`list=RD...`):*\n"
-        "YouTube Radio Mixes are dynamically generated on the fly by YouTube's recommendation engine. "
-        "To get an exact, fixed playlist in a specific order, save the mix to your library first and send the `list=PL...` link.\n\n"
-        "⚙️ *Audio Specifications:*\n"
-        "• Formats: MP3 (192/320 kbps) or Native M4A source-copy\n"
-        "• Embedded tags: High-res Cover Artwork, Title, and Artist metadata\n\n"
-        "⚠️ *Limitations & Safeguards:*\n"
-        f"• Maximum file size: {config.max_file_size_mb} MB (Telegram Bot API limit).\n"
-        f"• Playlists: Capped at {config.max_playlist_tracks} tracks.\n"
-        "• Live streams cannot be converted.\n"
-        "• Private or geo-restricted videos will be skipped gracefully."
+        "• *Search:* Just type any song or artist name (e.g. `Queen Bohemian Rhapsody`).\n"
+        "• *Links:* Send any YouTube video or playlist link.\n"
+        "• *Quality:* Use /settings to switch between MP3 and Native M4A.\n\n"
+        "> ⚠️ *Important:* YouTube 'My Mix' links change dynamically. To get a fixed playlist, save the mix to your library first.\n\n"
+        "⚙️ *Specifications:*\n"
+        f"• Max file size: {config.max_file_size_mb} MB\n"
+        f"• Playlist limit: {config.max_playlist_tracks} tracks\n"
+        "• Live streams and private videos are skipped gracefully."
     )
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
@@ -218,30 +212,37 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.effective_message:
         return
 
-    cache_engine = "Redis (In-Memory)" if cache_manager.is_redis_active else "SQLite (Fallback)"
-    bot_server_type = "Local Bot API Server (2GB)" if config.telegram_local_mode or config.telegram_api_server_url else "Telegram Public Gateway (50MB)"
-    mode_type = "Webhooks (High-Throughput)" if config.webhook_mode else "Long-Polling"
-    worker_status = "Distributed Worker Cluster" if config.worker_mode else f"In-Process Queue ({config.max_concurrent_downloads} workers)"
-    proxy_status = "Rotating Proxy Pool Active" if (config.youtube_proxy or config.youtube_proxy_pool) else "Direct Server IP"
+    user_id = update.effective_user.id if update.effective_user else 0
+    is_admin = user_id in config.admin_users
 
-    text = (
-        "🟢 *Bot Status: Online*\n\n"
-        "• Engine: `yt-dlp` + `FFmpeg`\n"
-        f"• Telegram Gateway: `{bot_server_type}`\n"
-        f"• Ingestion Mode: `{mode_type}`\n"
-        f"• Download Architecture: `{worker_status}`\n"
-        f"• Proxy Protection: `{proxy_status}`\n"
-        f"• Audio Cache: `{cache_engine}`\n"
-        f"• Concurrency Limit: `{config.max_concurrent_downloads} workers`\n"
-        f"• Active Downloads: `{queue_manager.active_count}`\n"
-        f"• Queue Depth: `{queue_manager.waiting_count}`\n"
-        f"• Max Upload Size: `{config.max_file_size_mb} MB`\n"
-        f"• Default Audio Quality: `{config.audio_bitrate} kbps MP3`\n"
-        "• Pipelined Streaming: `Enabled`\n"
-        "• Ready to download audio!\n\n"
-        "📊 *Metrics:*\n"
-        f"```\n{metrics.get_summary()}\n```"
-    )
+    if is_admin:
+        cache_engine = "Redis (In-Memory)" if cache_manager.is_redis_active else "SQLite (Fallback)"
+        bot_server_type = "Local Bot API Server (2GB)" if config.telegram_local_mode or config.telegram_api_server_url else "Telegram Public Gateway (50MB)"
+        mode_type = "Webhooks (High-Throughput)" if config.webhook_mode else "Long-Polling"
+        worker_status = "Distributed Worker Cluster" if config.worker_mode else f"In-Process Queue ({config.max_concurrent_downloads} workers)"
+        proxy_status = "Rotating Proxy Pool Active" if (config.youtube_proxy or config.youtube_proxy_pool) else "Direct Server IP"
+
+        text = (
+            "🟢 *Admin Diagnostics: Online*\n\n"
+            "• Engine: `yt-dlp` + `FFmpeg`\n"
+            f"• Telegram Gateway: `{bot_server_type}`\n"
+            f"• Ingestion Mode: `{mode_type}`\n"
+            f"• Download Architecture: `{worker_status}`\n"
+            f"• Proxy Protection: `{proxy_status}`\n"
+            f"• Audio Cache: `{cache_engine}`\n"
+            f"• Concurrency Limit: `{config.max_concurrent_downloads} workers`\n"
+            f"• Active Downloads: `{queue_manager.active_count}`\n"
+            f"• Queue Depth: `{queue_manager.waiting_count}`\n"
+            "📊 *Metrics:*\n"
+            f"```\n{metrics.get_summary()}\n```"
+        )
+    else:
+        text = (
+            "🟢 *TubeTapper is Online!*\n\n"
+            f"🎵 Active Downloads: {queue_manager.active_count}\n"
+            f"⏳ Songs in Queue: {queue_manager.waiting_count}"
+        )
+
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
 
@@ -789,6 +790,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
         await query.answer(f"Quality updated to {name}!")
+
+    elif data == "cmd_settings":
+        await query.answer()
+        await settings_command(update, context)
+
+    elif data == "cmd_help":
+        await query.answer()
+        await help_command(update, context)
 
 
 @restricted

@@ -130,12 +130,13 @@ async def test_status_command():
     mock_update.effective_message.reply_text = AsyncMock()
     mock_context = MagicMock()
 
+    mock_update.effective_user.id = 12345 # non-admin
+
     await status_command(mock_update, mock_context)
     mock_update.effective_message.reply_text.assert_called_once()
     args, _ = mock_update.effective_message.reply_text.call_args
-    assert "Online" in args[0]
-    assert "Audio Cache" in args[0]
-    assert "Concurrency Limit" in args[0]
+    assert "TubeTapper is Online!" in args[0]
+    assert "Active Downloads" in args[0]
 
 
 @pytest.mark.asyncio

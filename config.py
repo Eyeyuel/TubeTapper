@@ -19,6 +19,7 @@ class AppConfig:
 
     bot_token: str
     allowed_users: Set[int] = field(default_factory=set)
+    admin_users: Set[int] = field(default_factory=set)
     download_dir: Path = field(default=Path("./downloads"))
     audio_bitrate: int = 192
     max_file_size_mb: int = 50
@@ -71,6 +72,14 @@ def load_config() -> AppConfig:
             cleaned = item.strip()
             if cleaned.isdigit():
                 allowed_users.add(int(cleaned))
+
+    raw_admin = os.getenv("ADMIN_USERS", "").strip()
+    admin_users: Set[int] = set()
+    if raw_admin:
+        for item in raw_admin.split(","):
+            cleaned = item.strip()
+            if cleaned.isdigit():
+                admin_users.add(int(cleaned))
 
     raw_download_dir = os.getenv("DOWNLOAD_DIR", "./downloads").strip()
     download_path = Path(raw_download_dir).resolve()
@@ -167,6 +176,7 @@ def load_config() -> AppConfig:
     return AppConfig(
         bot_token=raw_token,
         allowed_users=allowed_users,
+        admin_users=admin_users,
         download_dir=download_path,
         audio_bitrate=bitrate,
         max_file_size_mb=max_size_mb,

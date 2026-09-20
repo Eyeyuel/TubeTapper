@@ -11,12 +11,12 @@ logger = setup_logger("progress")
 def render_progress_bar(percentage: float, width: int = 10) -> str:
     """Renders a clean visual Unicode progress bar.
 
-    Example: 60.0% -> '▰▰▰▰▰▰▱▱▱▱ 60%'
+    Example: 60.0% -> '[██████░░░░] 60%'
     """
     clamped = max(0.0, min(100.0, float(percentage)))
     filled_count = int(round(width * (clamped / 100.0)))
     empty_count = width - filled_count
-    return f"{'▰' * filled_count}{'▱' * empty_count} {clamped:.0f}%"
+    return f"[{'█' * filled_count}{'░' * empty_count}] {clamped:.0f}%"
 
 
 async def update_status_message(

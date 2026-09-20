@@ -19,13 +19,16 @@ from helpers.cache import cache_manager
 def test_render_progress_bar():
     """Test progress bar strings across various percentages."""
     bar_0 = render_progress_bar(0)
-    assert "▱▱▱▱▱▱▱▱▱▱ 0%" in bar_0
+    assert "[░░░░░░░░░░] 0%" in bar_0
 
     bar_50 = render_progress_bar(50)
-    assert "▰▰▰▰▰▱▱▱▱▱ 50%" in bar_50
+    assert "[█████░░░░░] 50%" in bar_50
 
     bar_100 = render_progress_bar(100)
-    assert "▰▰▰▰▰▰▰▰▰▰ 100%" in bar_100
+    assert "[██████████] 100%" in bar_100
+
+    bar_over = render_progress_bar(150)
+    assert "[██████████] 100%" in bar_over
 
 
 def test_build_settings_keyboard():

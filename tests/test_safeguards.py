@@ -64,7 +64,7 @@ async def test_access_control_whitelist_rejected(monkeypatch):
     # Verify access denied reply was sent
     mock_update.effective_message.reply_text.assert_called_once()
     args, kwargs = mock_update.effective_message.reply_text.call_args
-    assert "Access Denied" in args[0]
+    assert "currently private" in args[0]
 
 
 @pytest.mark.asyncio
