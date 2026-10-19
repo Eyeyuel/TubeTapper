@@ -40,9 +40,8 @@ async def test_sqlite_cache_set_and_get(tmp_path):
 
 @pytest.mark.asyncio
 async def test_sqlite_cache_ttl_expiration(tmp_path):
-    """Test that expired records are purged and return None."""
-    # Set TTL to 1 second
-    cache = AudioCacheManager(redis_url="", cache_dir=tmp_path, ttl_days=0)
+    """Test that expired records are purged when TTL is explicitly enabled."""
+    cache = AudioCacheManager(redis_url="", cache_dir=tmp_path, ttl_days=0, enable_sqlite_ttl=True)
     cache.ttl_seconds = 1
     await cache.initialize()
 
@@ -62,6 +61,47 @@ async def test_sqlite_cache_ttl_expiration(tmp_path):
     # Should now be expired and deleted
     expired = await cache.get("expiring_vid")
     assert expired is None
+
+
+@pytest.mark.asyncio
+async def test_sqlite_cache_permanent_persistence(tmp_path):
+    """Test that records are permanently preserved by default."""
+    cache = AudioCacheManager(redis_url="", cache_dir=tmp_path)
+    cache.ttl_seconds = 1
+    await cache.initialize()
+
+    await cache.set(
+        video_id="perm_vid",
+        file_id="PERM_FILE",
+        title="Permanent Track",
+        format_id="mp4_720",
+    )
+
+    await asyncio.sleep(1.1)
+
+    # Should remain accessible and permanent
+    cached = await cache.get("perm_vid", format_id="mp4_720")
+    assert cached is not None
+    assert cached["file_id"] == "PERM_FILE"
+
+
+@pytest.mark.asyncio
+async def test_composite_key_formats_coexist(tmp_path):
+    """Test that audio and video formats for the same video_id coexist independently."""
+    cache = AudioCacheManager(redis_url="", cache_dir=tmp_path)
+    await cache.initialize()
+
+    # Store MP3 and MP4 for the exact same video_id
+    await cache.set("multi_vid", "FILE_MP3", title="Multi Vid", format_id="mp3_320")
+    await cache.set("multi_vid", "FILE_MP4", title="Multi Vid", format_id="mp4_1080")
+
+    mp3_cached = await cache.get("multi_vid", format_id="mp3_320")
+    mp4_cached = await cache.get("multi_vid", format_id="mp4_1080")
+
+    assert mp3_cached is not None
+    assert mp3_cached["file_id"] == "FILE_MP3"
+    assert mp4_cached is not None
+    assert mp4_cached["file_id"] == "FILE_MP4"
 
 
 @pytest.mark.asyncio

@@ -87,7 +87,8 @@ async def test_onboarding_descriptions_and_startup():
     mock_app.bot.set_my_commands = AsyncMock()
     mock_app.bot.set_chat_menu_button = AsyncMock()
 
-    with patch("bot.cache_manager.initialize", new_callable=AsyncMock) as mock_init:
+    with patch("bot.cache_manager.initialize", new_callable=AsyncMock) as mock_init, \
+         patch("bot.start_metrics_server"):
         await on_startup(mock_app)
         mock_init.assert_called_once()
         mock_app.bot.set_my_description.assert_called_once_with(description=ONBOARDING_DESCRIPTION)

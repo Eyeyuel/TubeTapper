@@ -34,6 +34,10 @@ def cleanup_orphaned_downloads(
         if not file_path.is_file():
             continue
 
+        # Protect SQLite cache files from cleanup
+        if file_path.name in ("cache.db", "cache.db-wal", "cache.db-shm", ".gitignore"):
+            continue
+
         try:
             mtime = file_path.stat().st_mtime
             age = now - mtime

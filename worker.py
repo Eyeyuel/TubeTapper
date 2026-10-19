@@ -46,7 +46,7 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
         cached = await cache_manager.get(video_id, audio_format)
         if cached and cached.get("file_id"):
             logger.info(f"[Worker] Instant cache delivery for {video_id} to chat {chat_id}")
-            is_video = audio_format == "mp4"
+            is_video = audio_format.startswith("mp4")
             send_func = bot.send_video if is_video else bot.send_audio
             kwargs = {
                 "chat_id": chat_id,
@@ -111,7 +111,7 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
 
     try:
         try:
-            action = ChatAction.UPLOAD_VIDEO if audio_format == "mp4" else ChatAction.UPLOAD_VOICE
+            action = ChatAction.UPLOAD_VIDEO if audio_format.startswith("mp4") else ChatAction.UPLOAD_VOICE
             await bot.send_chat_action(chat_id=chat_id, action=action)
         except Exception:
             pass
@@ -123,7 +123,7 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
                 else None
             )
             try:
-                is_video = audio_format == "mp4"
+                is_video = audio_format.startswith("mp4")
                 send_func = bot.send_video if is_video else bot.send_audio
                 kwargs = {
                     "chat_id": chat_id,
@@ -155,6 +155,8 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
                 title=track_data.get("title"),
                 artist=track_data.get("artist"),
                 duration=track_data.get("duration"),
+                format_id=audio_format,
+                file_size=track_data.get("filesize", 0),
             )
 
         if status_msg_id:

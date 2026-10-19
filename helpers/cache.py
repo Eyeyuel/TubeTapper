@@ -36,10 +36,12 @@ class AudioCacheManager:
         self,
         redis_url: Optional[str] = None,
         cache_dir: Optional[Union[str, Path]] = None,
-        ttl_days: int = 30,
+        ttl_days: Optional[int] = None,
+        enable_sqlite_ttl: bool = False,
     ) -> None:
         self.redis_url = redis_url if redis_url is not None else global_config.redis_url
-        self.ttl_seconds = ttl_days * 86400
+        self.enable_sqlite_ttl = enable_sqlite_ttl
+        self.ttl_seconds = (ttl_days * 86400) if ttl_days is not None else (30 * 86400)
         self.cache_dir = Path(cache_dir or global_config.download_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.sqlite_path = self.cache_dir / "cache.db"
@@ -49,17 +51,18 @@ class AudioCacheManager:
         self._local_locks: Dict[str, asyncio.Lock] = {}
         self._lock_dict_mutex = asyncio.Lock()
 
-        # Initialize SQLite fallback schema
+        # Initialize SQLite schema and migration
         self._init_sqlite()
 
     def _init_sqlite(self) -> None:
-        """Initializes SQLite database and tables for fallback caching."""
+        """Initializes SQLite database and tables for permanent caching and settings."""
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA busy_timeout=5000")
                 conn.executescript(
                     """
+                    -- Legacy table support
                     CREATE TABLE IF NOT EXISTS audio_cache (
                         video_id TEXT PRIMARY KEY,
                         file_id TEXT NOT NULL,
@@ -68,6 +71,24 @@ class AudioCacheManager:
                         duration INTEGER,
                         created_at REAL
                     );
+
+                    -- Modern permanent media cache with composite primary key
+                    CREATE TABLE IF NOT EXISTS media_cache (
+                        video_id TEXT NOT NULL,
+                        format_id TEXT NOT NULL,
+                        file_id TEXT NOT NULL,
+                        title TEXT,
+                        artist TEXT,
+                        duration INTEGER,
+                        file_size INTEGER DEFAULT 0,
+                        created_at REAL,
+                        PRIMARY KEY (video_id, format_id)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_media_lookup ON media_cache (video_id, format_id);
+                    CREATE INDEX IF NOT EXISTS idx_media_title ON media_cache (title);
+
+                    -- User preference settings (mode, format, quality)
                     CREATE TABLE IF NOT EXISTS user_settings (
                         user_id INTEGER NOT NULL,
                         setting_key TEXT NOT NULL,
@@ -76,6 +97,28 @@ class AudioCacheManager:
                     );
                     """
                 )
+
+                # Migrate any existing records from legacy audio_cache to media_cache
+                try:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO media_cache (video_id, format_id, file_id, title, artist, duration, file_size, created_at)
+                        SELECT 
+                            CASE 
+                                WHEN INSTR(video_id, '_') > 0 THEN SUBSTR(video_id, 1, INSTR(video_id, '_') - 1)
+                                ELSE video_id
+                            END as video_id,
+                            CASE 
+                                WHEN INSTR(video_id, '_') > 0 THEN SUBSTR(video_id, INSTR(video_id, '_') + 1)
+                                ELSE 'mp3'
+                            END as format_id,
+                            file_id, title, artist, duration, 0, created_at
+                        FROM audio_cache;
+                        """
+                    )
+                except Exception as mig_exc:
+                    logger.debug(f"Cache migration notice: {mig_exc}")
+
                 conn.commit()
         except Exception as exc:
             logger.warning(f"Failed to initialize SQLite fallback cache: {exc}")
@@ -125,46 +168,102 @@ class AudioCacheManager:
                 key = f"tubetapper:cache:audio:{cache_key}"
                 raw = await self._redis_client.get(key)
                 if raw:
-                    logger.debug(f"Redis cache HIT for {video_id}")
+                    logger.debug(f"Redis cache HIT for {video_id} ({format_id})")
                     metrics.increment("cache_hits")
                     return json.loads(raw)
             except Exception as exc:
                 logger.warning(f"Redis get error for {video_id}: {exc}. Checking SQLite...")
 
-        # 2. SQLite fallback lookup
-        result = await asyncio.to_thread(self._get_sqlite, cache_key)
+        # 2. SQLite lookup
+        result = await asyncio.to_thread(self._get_sqlite, video_id, format_id)
         if result is None:
             metrics.increment("cache_misses")
         else:
             metrics.increment("cache_hits")
         return result
 
-    def _get_sqlite(self, video_id: str) -> Optional[Dict[str, Any]]:
-        """Synchronous SQLite cache lookup with TTL verification."""
+    def _get_sqlite(self, video_id: str, format_id: str = "mp3") -> Optional[Dict[str, Any]]:
+        """Synchronous SQLite cache lookup with permanent persistence."""
+        cache_key = f"{video_id}_{format_id}"
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
                 cursor = conn.cursor()
+
+                # 1. Query media_cache by composite key
                 cursor.execute(
-                    "SELECT file_id, title, artist, duration, created_at FROM audio_cache WHERE video_id = ?",
-                    (video_id,),
+                    """
+                    SELECT file_id, title, artist, duration, file_size, created_at 
+                    FROM media_cache 
+                    WHERE video_id = ? AND format_id = ?
+                    """,
+                    (video_id, format_id),
                 )
                 row = cursor.fetchone()
+
+                # 2. Fallback: check other MP3 bitrates / generic mp3 in media_cache
+                if not row and format_id.startswith("mp3"):
+                    for alt in ("mp3", "mp3_320", "mp3_192"):
+                        if alt != format_id:
+                            cursor.execute(
+                                "SELECT file_id, title, artist, duration, file_size, created_at FROM media_cache WHERE video_id = ? AND format_id = ?",
+                                (video_id, alt),
+                            )
+                            row = cursor.fetchone()
+                            if row:
+                                break
+
+                # 3. Fallback: check legacy audio_cache table
+                if not row:
+                    cursor.execute(
+                        "SELECT file_id, title, artist, duration, 0, created_at FROM audio_cache WHERE video_id = ?",
+                        (cache_key,),
+                    )
+                    row = cursor.fetchone()
+
+                if not row and format_id.startswith("mp3"):
+                    for alt in ("mp3", "mp3_320", "mp3_192"):
+                        cursor.execute(
+                            "SELECT file_id, title, artist, duration, 0, created_at FROM audio_cache WHERE video_id = ?",
+                            (f"{video_id}_{alt}",),
+                        )
+                        row = cursor.fetchone()
+                        if row:
+                            break
+
+                # 4. Fallback: check bare video_id in media_cache and audio_cache
+                if not row:
+                    cursor.execute(
+                        "SELECT file_id, title, artist, duration, file_size, created_at FROM media_cache WHERE video_id = ?",
+                        (video_id,),
+                    )
+                    row = cursor.fetchone()
+
+                if not row:
+                    cursor.execute(
+                        "SELECT file_id, title, artist, duration, 0, created_at FROM audio_cache WHERE video_id = ?",
+                        (video_id,),
+                    )
+                    row = cursor.fetchone()
+
                 if not row:
                     return None
 
-                file_id, title, artist, duration, created_at = row
-                if time.time() - created_at > self.ttl_seconds:
-                    # Stale entry
-                    cursor.execute("DELETE FROM audio_cache WHERE video_id = ?", (video_id,))
+                file_id, title, artist, duration, file_size, created_at = row
+
+                # Optional TTL check (disabled by default for permanent storage)
+                if self.enable_sqlite_ttl and self.ttl_seconds > 0 and (time.time() - created_at > self.ttl_seconds):
+                    cursor.execute("DELETE FROM media_cache WHERE video_id = ? AND format_id = ?", (video_id, format_id))
+                    cursor.execute("DELETE FROM audio_cache WHERE video_id = ?", (cache_key,))
                     conn.commit()
                     return None
 
-                logger.debug(f"SQLite cache HIT for {video_id}")
+                logger.debug(f"SQLite cache HIT for {video_id} ({format_id})")
                 return {
                     "file_id": file_id,
                     "title": title,
                     "artist": artist,
                     "duration": duration,
+                    "file_size": file_size,
                     "created_at": created_at,
                 }
         except Exception as exc:
@@ -179,23 +278,24 @@ class AudioCacheManager:
         artist: Optional[str] = None,
         duration: Optional[int] = None,
         format_id: str = "mp3",
+        file_size: int = 0,
     ) -> None:
-        """Saves a track's Telegram file_id and metadata to cache."""
+        """Saves a track's Telegram file_id and metadata permanently to cache."""
         if not video_id or not file_id:
             return
 
         cache_key = f"{video_id}_{format_id}"
-
         now = time.time()
         record = {
             "file_id": file_id,
             "title": title or "",
             "artist": artist or "",
             "duration": duration or 0,
+            "file_size": file_size or 0,
             "created_at": now,
         }
 
-        # 1. Attempt Redis write
+        # 1. Attempt Redis write (with TTL to protect RAM)
         if self._is_redis_active and self._redis_client:
             try:
                 key = f"tubetapper:cache:audio:{cache_key}"
@@ -204,20 +304,40 @@ class AudioCacheManager:
             except Exception as exc:
                 logger.warning(f"Redis set error for {cache_key}: {exc}. Writing to SQLite fallback...")
 
-        # 2. Always persist to SQLite fallback as well for durability
-        await asyncio.to_thread(self._set_sqlite, cache_key, record)
+        # 2. Always persist permanently to SQLite
+        await asyncio.to_thread(self._set_sqlite, video_id, format_id, record)
 
-    def _set_sqlite(self, video_id: str, record: Dict[str, Any]) -> None:
-        """Synchronous SQLite cache write."""
+    def _set_sqlite(self, video_id: str, format_id: str, record: Dict[str, Any]) -> None:
+        """Synchronous SQLite cache write across media_cache and legacy audio_cache."""
+        cache_key = f"{video_id}_{format_id}"
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
+                # Insert to media_cache
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO media_cache (video_id, format_id, file_id, title, artist, duration, file_size, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        video_id,
+                        format_id,
+                        record["file_id"],
+                        record["title"],
+                        record["artist"],
+                        record["duration"],
+                        record.get("file_size", 0),
+                        record["created_at"],
+                    ),
+                )
+
+                # Maintain legacy audio_cache table for backwards compatibility
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO audio_cache (video_id, file_id, title, artist, duration, created_at)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        video_id,
+                        cache_key,
                         record["file_id"],
                         record["title"],
                         record["artist"],
@@ -226,7 +346,7 @@ class AudioCacheManager:
                     ),
                 )
                 conn.commit()
-                logger.debug(f"Saved {video_id} to SQLite cache.")
+                logger.debug(f"Saved {video_id} ({format_id}) to permanent SQLite cache.")
         except Exception as exc:
             logger.warning(f"SQLite set error for {video_id}: {exc}")
 

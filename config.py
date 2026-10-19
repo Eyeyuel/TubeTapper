@@ -100,8 +100,14 @@ def load_config() -> AppConfig:
 
     # If running with local Telegram Bot API server, default file size limit increases to 2000MB (2GB)
     default_max_size = 2000 if telegram_local_mode else 50
+    raw_max_size = os.getenv("MAX_FILE_SIZE_MB", "").strip()
     try:
-        max_size_mb = int(os.getenv("MAX_FILE_SIZE_MB", str(default_max_size)).strip())
+        if raw_max_size:
+            parsed_max = int(raw_max_size)
+            # If local mode is active and env is standard 50, scale up to 2000MB
+            max_size_mb = 2000 if (telegram_local_mode and parsed_max == 50) else parsed_max
+        else:
+            max_size_mb = default_max_size
     except ValueError:
         max_size_mb = default_max_size
 

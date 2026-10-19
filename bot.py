@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import nullcontext
+import hashlib
 import os
 import re
 from functools import wraps
@@ -64,46 +65,144 @@ YOUTUBE_URL_REGEX = re.compile(
 # Registry of active playlist cancellation events keyed by chat_id
 ACTIVE_PLAYLIST_CANCELLATIONS: Dict[int, asyncio.Event] = {}
 
+# In-memory mapping for long playlist URLs to stay well within Telegram's 64-byte callback_data limit
+PENDING_PLAYLIST_URLS: Dict[str, str] = {}
 
-async def send_upload_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """Sends native Telegram chat action 'uploading audio...' safely."""
+
+async def send_upload_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int, is_video: bool = False) -> None:
+    """Sends native Telegram chat action 'uploading audio/video...' safely."""
     try:
-        action_coro = context.bot.send_chat_action(
-            chat_id=chat_id, action=ChatAction.UPLOAD_VOICE
-        )
+        action = ChatAction.UPLOAD_VIDEO if is_video else ChatAction.UPLOAD_VOICE
+        action_coro = context.bot.send_chat_action(chat_id=chat_id, action=action)
         if asyncio.iscoroutine(action_coro):
             await action_coro
     except Exception as exc:
         logger.debug(f"send_chat_action notice error (non-fatal): {exc}")
 
 
+async def get_user_preferences(user_id: int) -> Tuple[str, str, str]:
+    """Retrieves user's download_mode, audio_format, and video_quality.
+    
+    Returns: (download_mode, audio_format, video_quality)
+    """
+    mode = await cache_manager.get_user_setting(user_id, "download_mode", "auto")
+    audio_fmt = await cache_manager.get_user_setting(user_id, "audio_format", "mp3_320")
+    vid_fmt = await cache_manager.get_user_setting(user_id, "video_quality", "mp4_720")
+
+    # Normalize legacy formats if stored in user preferences
+    if audio_fmt in ("mp4", "mp4_480", "mp4_720", "mp4_1080"):
+        vid_fmt = "mp4_720" if audio_fmt == "mp4" else audio_fmt
+        audio_fmt = "mp3_320"
+    if vid_fmt not in ("mp4_480", "mp4_720", "mp4_1080"):
+        vid_fmt = "mp4_720"
+
+    return mode, audio_fmt, vid_fmt
+
+
 async def get_user_audio_format(user_id: int) -> Tuple[str, int]:
     """Retrieves user's preferred audio format and bitrate.
     
-    Returns: (audio_format, bitrate) e.g. ('mp3', 192), ('mp3', 320), or ('m4a', 0)
+    Returns: (audio_format, bitrate) e.g. ('mp3', 320)
     """
-    pref = await cache_manager.get_user_setting(user_id, "audio_format", "mp3_192")
-    if pref == "mp3_320":
-        return "mp3", 320
+    pref = await cache_manager.get_user_setting(user_id, "audio_format", "mp3_320")
+    if pref == "mp3_192":
+        return "mp3", 192
     elif pref == "m4a":
         return "m4a", 0
-    return "mp3", 192
+    return "mp3", 320
 
 
-def build_settings_keyboard(current_pref: str) -> InlineKeyboardMarkup:
-    """Builds inline keyboard for audio format selection with a checkmark on the active setting."""
-    b1_check = " ✅" if current_pref == "mp3_192" else ""
-    b2_check = " ✅" if current_pref == "mp3_320" else ""
-    b3_check = " ✅" if current_pref == "m4a" else ""
-    b4_check = " ✅" if current_pref == "mp4" else ""
+def build_settings_keyboard(
+    mode_or_pref: str = "auto",
+    audio_fmt: Optional[str] = None,
+    vid_fmt: Optional[str] = None,
+) -> InlineKeyboardMarkup:
+    """Builds inline keyboard for settings divided into 3 distinct sections with independent checkmarks."""
+    if audio_fmt is None and vid_fmt is None:
+        if mode_or_pref in ("auto", "ask", "always_audio", "always_video"):
+            mode = mode_or_pref
+            aud = "mp3_320"
+            vid = "mp4_720"
+        elif mode_or_pref in ("mp3_192", "mp3_320", "m4a"):
+            mode = "auto"
+            aud = mode_or_pref
+            vid = "mp4_720"
+        elif mode_or_pref in ("mp4_480", "mp4_720", "mp4_1080", "mp4"):
+            mode = "always_video"
+            aud = "mp3_320"
+            vid = "mp4_720" if mode_or_pref == "mp4" else mode_or_pref
+        else:
+            mode = "auto"
+            aud = "mp3_320"
+            vid = "mp4_720"
+    else:
+        mode = mode_or_pref
+        aud = audio_fmt or "mp3_320"
+        vid = vid_fmt or "mp4_720"
 
     keyboard = [
-        [InlineKeyboardButton(f"🎵 MP3 - 192 kbps (Standard){b1_check}", callback_data="set_fmt:mp3_192")],
-        [InlineKeyboardButton(f"🎧 MP3 - 320 kbps (High Quality){b2_check}", callback_data="set_fmt:mp3_320")],
-        [InlineKeyboardButton(f"⚡ M4A - Native Source Copy (Fastest){b3_check}", callback_data="set_fmt:m4a")],
-        [InlineKeyboardButton(f"🎬 Video - MP4 / Shorts{b4_check}", callback_data="set_fmt:mp4")],
+        # Section 1: Download Mode
+        [
+            InlineKeyboardButton(f"🤖 Smart Auto{' ✅' if mode == 'auto' else ''}", callback_data="set_mode:auto"),
+            InlineKeyboardButton(f"⚡ Ask Every Time{' ✅' if mode == 'ask' else ''}", callback_data="set_mode:ask"),
+        ],
+        [
+            InlineKeyboardButton(f"🎵 Always Audio{' ✅' if mode == 'always_audio' else ''}", callback_data="set_mode:always_audio"),
+            InlineKeyboardButton(f"🎬 Always Video{' ✅' if mode == 'always_video' else ''}", callback_data="set_mode:always_video"),
+        ],
+        # Section 2: Preferred Audio Quality
+        [
+            InlineKeyboardButton(f"🎵 192k{' ✅' if aud == 'mp3_192' else ''}", callback_data="set_aud:mp3_192"),
+            InlineKeyboardButton(f"🎧 320k (HQ){' ✅' if aud == 'mp3_320' else ''}", callback_data="set_aud:mp3_320"),
+            InlineKeyboardButton(f"⚡ M4A{' ✅' if aud == 'm4a' else ''}", callback_data="set_aud:m4a"),
+        ],
+        # Section 3: Preferred Video Quality
+        [
+            InlineKeyboardButton(f"🎬 480p{' ✅' if vid == 'mp4_480' else ''}", callback_data="set_vid:mp4_480"),
+            InlineKeyboardButton(f"🎬 720p (HD){' ✅' if vid in ('mp4_720', 'mp4') else ''}", callback_data="set_vid:mp4_720"),
+            InlineKeyboardButton(f"🎬 1080p (FHD){' ✅' if vid == 'mp4_1080' else ''}", callback_data="set_vid:mp4_1080"),
+        ],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def build_format_picker_keyboard(media_id: str, is_playlist: bool = False) -> InlineKeyboardMarkup:
+    """Builds interactive 6-button keyboard for selecting audio or video resolution."""
+    prefix = "plfmt" if is_playlist else "fmt"
+    keyboard = [
+        [
+            InlineKeyboardButton("🎵 MP3 192k", callback_data=f"{prefix}:mp3_192:{media_id}"),
+            InlineKeyboardButton("🎧 MP3 320k", callback_data=f"{prefix}:mp3_320:{media_id}"),
+            InlineKeyboardButton("⚡ M4A Native", callback_data=f"{prefix}:m4a:{media_id}"),
+        ],
+        [
+            InlineKeyboardButton("🎬 480p Fast", callback_data=f"{prefix}:mp4_480:{media_id}"),
+            InlineKeyboardButton("🎬 720p HD", callback_data=f"{prefix}:mp4_720:{media_id}"),
+            InlineKeyboardButton("🎬 1080p FHD", callback_data=f"{prefix}:mp4_1080:{media_id}"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_delivery_switch_keyboard(
+    video_id: str,
+    current_format: str,
+    default_audio: str = "mp3_320",
+    default_video: str = "mp4_720",
+) -> Optional[InlineKeyboardMarkup]:
+    """Builds a 1-tap quick switch button attached to delivered media."""
+    if not video_id:
+        return None
+    if current_format.startswith("mp4"):
+        aud_label = "🎧 Extract MP3 (320k)" if default_audio == "mp3_320" else f"🎵 Extract Audio ({default_audio})"
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(aud_label, callback_data=f"fmt:{default_audio}:{video_id}")]
+        ])
+    else:
+        vid_label = "🎬 Get Video (720p HD)" if default_video == "mp4_720" else f"🎬 Get Video ({default_video.replace('mp4_', '')}p)"
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(vid_label, callback_data=f"fmt:{default_video}:{video_id}")]
+        ])
 
 
 def build_search_keyboard(results: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
@@ -257,23 +356,29 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 @restricted
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Lets user customize preferred audio format and quality."""
+    """Lets user customize preferred download mode, audio bitrate, and video resolution."""
     if not update.effective_message or not update.effective_user:
         return
 
     user_id = update.effective_user.id
-    current_pref = await cache_manager.get_user_setting(user_id, "audio_format", "mp3_192")
+    mode, audio_fmt, vid_fmt = await get_user_preferences(user_id)
 
     text = (
-        "⚙️ *Audio Download Settings*\n\n"
-        "Choose your preferred audio format and quality for downloads:\n\n"
-        "• *MP3 192 kbps*: Balanced quality & compact file size (default).\n"
-        "• *MP3 320 kbps*: Studio / high-fidelity audio quality.\n"
-        "• *M4A Native Copy*: Zero re-encoding, instant extraction directly from YouTube streams."
+        "⚙️ *TubeTapper Download Settings*\n\n"
+        "Customize your download mode and default quality preferences:\n\n"
+        "📥 *Download Mode:*\n"
+        "• 🤖 *Smart Auto*: Shorts download as HD Video; music/videos download as High-Quality Audio.\n"
+        "• ⚡ *Ask Every Time*: Prompts you with 6 format buttons whenever you send a link.\n"
+        "• 🎵 *Always Audio*: Directly downloads audio from all links.\n"
+        "• 🎬 *Always Video*: Directly downloads video from all links.\n\n"
+        "🎧 *Default Audio Quality*: Bitrate used for music/audio.\n"
+        "🎬 *Default Video Quality*: Resolution used for videos and shorts.\n\n"
+        "────────────────────────\n"
+        "Tap any button below to update your preferences:"
     )
     await update.effective_message.reply_text(
         text,
-        reply_markup=build_settings_keyboard(current_pref),
+        reply_markup=build_settings_keyboard(mode, audio_fmt, vid_fmt),
         parse_mode="Markdown",
     )
 
@@ -335,37 +440,79 @@ async def handle_single_track(
     context: ContextTypes.DEFAULT_TYPE,
     status_msg: telegram.Message,
     downloader: AudioDownloader,
+    requested_format: Optional[str] = None,
 ) -> None:
     """Handles downloading and uploading a single YouTube track."""
     chat_id = update.effective_chat.id
     reply_to = update.effective_message.message_id if update.effective_message else None
     user_id = update.effective_user.id if update.effective_user else 0
 
-    audio_format, bitrate = await get_user_audio_format(user_id)
-    
-    # Auto-detect Shorts and default to Video format for better UX
-    if "/shorts/" in url.lower():
-        audio_format = "mp4"
+    mode, default_audio_fmt, default_vid_fmt = await get_user_preferences(user_id)
+    video_id = downloader.extract_video_id(url)
+
+    if requested_format:
+        audio_format = requested_format
+    else:
+        if mode == "ask":
+            try:
+                info = await asyncio.to_thread(downloader.get_video_info, url)
+                title = info.get("title", "YouTube Video")
+                duration = int(info.get("duration") or 0)
+                dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else "Unknown"
+            except Exception:
+                title = "YouTube Video"
+                dur_str = "Unknown"
+
+            text = (
+                f"🎬 *{title}*\n"
+                f"⏱ Duration: `{dur_str}`\n\n"
+                f"*Choose your download format:*"
+            )
+            media_id = video_id or url
+            await update_status_message(
+                status_msg,
+                text,
+                reply_markup=build_format_picker_keyboard(media_id, is_playlist=False),
+            )
+            return
+        elif mode == "always_audio":
+            audio_format = default_audio_fmt
+        elif mode == "always_video":
+            audio_format = default_vid_fmt
+        else:
+            # Smart Auto: Shorts -> default video quality, others -> default audio quality
+            if "/shorts/" in url.lower():
+                audio_format = default_vid_fmt
+            else:
+                audio_format = default_audio_fmt
+
+    bitrate = 192 if audio_format == "mp3_192" else (320 if audio_format == "mp3_320" else 0)
+    is_video = audio_format.startswith("mp4")
 
     metrics.increment("downloads_total")
 
+    # Quick format switch markup attached to delivery
+    switch_kb = build_delivery_switch_keyboard(video_id, audio_format, default_audio_fmt, default_vid_fmt)
+
     # 1. Instant Cache Check (Telegram file_id reuse)
-    video_id = downloader.extract_video_id(url)
     if video_id:
         try:
             cached = await cache_manager.get(video_id, audio_format)
             if cached and cached.get("file_id"):
-                logger.info(f"Delivering cached audio for video ID {video_id}")
+                media_type = "video" if is_video else "audio"
+                logger.info(f"Delivering cached {media_type} for video ID {video_id}")
                 metrics.increment("downloads_cached")
-                await update_status_message(status_msg, "⚡ *Found in cache! Delivering audio...*")
-                await send_upload_action(context, chat_id)
-                is_video = audio_format == "mp4"
+                await update_status_message(status_msg, f"⚡ *Found in cache! Delivering {media_type}...*")
+                await send_upload_action(context, chat_id, is_video=is_video)
                 send_func = context.bot.send_video if is_video else context.bot.send_audio
                 kwargs = {
                     "chat_id": chat_id,
                     "duration": cached.get("duration"),
                     "reply_to_message_id": reply_to,
                 }
+                if switch_kb:
+                    kwargs["reply_markup"] = switch_kb
+
                 if is_video:
                     kwargs["video"] = cached["file_id"]
                     kwargs["caption"] = f"{cached.get('title')} - {cached.get('artist')}"
@@ -378,27 +525,30 @@ async def handle_single_track(
                 await safe_delete_message(status_msg)
                 return
         except Exception as exc:
-            logger.warning(f"Failed to send cached audio: {exc}. Proceeding to fresh download.")
+            logger.warning(f"Failed to send cached media: {exc}. Proceeding to fresh download.")
 
     # 2. Cache Stampede Protection (Distributed Lock)
-    lock_manager = cache_manager.acquire_lock(video_id) if video_id else nullcontext()
+    lock_manager = cache_manager.acquire_lock(video_id, format_id=audio_format) if video_id else nullcontext()
     async with lock_manager:
         # Re-check cache after acquiring lock in case another request completed while waiting
         if video_id:
             try:
                 cached = await cache_manager.get(video_id, audio_format)
                 if cached and cached.get("file_id"):
-                    logger.info(f"Delivering cached audio (post-lock) for video ID {video_id}")
+                    media_type = "video" if is_video else "audio"
+                    logger.info(f"Delivering cached {media_type} (post-lock) for video ID {video_id}")
                     metrics.increment("downloads_cached")
-                    await update_status_message(status_msg, "⚡ *Found in cache! Delivering audio...*")
-                    await send_upload_action(context, chat_id)
-                    is_video = audio_format == "mp4"
+                    await update_status_message(status_msg, f"⚡ *Found in cache! Delivering {media_type}...*")
+                    await send_upload_action(context, chat_id, is_video=is_video)
                     send_func = context.bot.send_video if is_video else context.bot.send_audio
                     kwargs = {
                         "chat_id": chat_id,
                         "duration": cached.get("duration"),
                         "reply_to_message_id": reply_to,
                     }
+                    if switch_kb:
+                        kwargs["reply_markup"] = switch_kb
+
                     if is_video:
                         kwargs["video"] = cached["file_id"]
                         kwargs["caption"] = f"{cached.get('title')} - {cached.get('artist')}"
@@ -411,7 +561,7 @@ async def handle_single_track(
                     await safe_delete_message(status_msg)
                     return
             except Exception as exc:
-                logger.warning(f"Failed to send cached audio post-lock: {exc}. Proceeding to fresh download.")
+                logger.warning(f"Failed to send cached media post-lock: {exc}. Proceeding to fresh download.")
 
         # 3. Distributed Worker Queue Dispatch (if WORKER_MODE is enabled)
         if config.worker_mode and cache_manager.is_redis_active:
@@ -449,7 +599,7 @@ async def handle_single_track(
             )
 
         async with queue_manager.acquire_slot(notify_callback=notify_queue_position):
-            media_type = "video" if audio_format == "mp4" else "audio track"
+            media_type = "video" if is_video else "audio track"
             await update_status_message(status_msg, f"⬇️ *Downloading {media_type}...*")
 
             try:
@@ -464,21 +614,30 @@ async def handle_single_track(
                 )
                 return
 
-            # 50MB Telegram Upload Safeguard
+            # Telegram Upload Size Safeguard
             if track_data.get("exceeds_limit"):
                 size_mb = track_data.get("filesize", 0) // (1024 * 1024)
                 downloader.cleanup_files(
                     track_data.get("file_path"), track_data.get("thumbnail_path")
                 )
+                media_name = "Video" if is_video else "Audio"
+                retry_kb = None
+                if is_video and "480" not in audio_format and video_id:
+                    retry_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🎬 Try Fast 480p (Smaller Size)", callback_data=f"fmt:mp4_480:{video_id}")]
+                    ])
                 await update_status_message(
                     status_msg,
-                    f"⚠️ *File too large:* Audio file is {size_mb} MB, which exceeds "
-                    f"Telegram's {config.max_file_size_mb} MB bot limit. Cannot upload.",
+                    f"⚠️ *File too large:*\n{media_name} file is {size_mb} MB, which exceeds "
+                    f"Telegram's {config.max_file_size_mb} MB limit.\n\n"
+                    f"> 💡 *Tip:* Try downloading in 480p or Audio (MP3) for a much smaller file size.",
+                    reply_markup=retry_kb,
                 )
                 return
 
-            await update_status_message(status_msg, "📤 *Uploading audio to Telegram...*")
-            await send_upload_action(context, chat_id)
+            media_label = "video" if is_video else "audio"
+            await update_status_message(status_msg, f"📤 *Uploading {media_label} to Telegram...*")
+            await send_upload_action(context, chat_id, is_video=is_video)
 
             audio_path = track_data["file_path"]
             thumb_path = track_data.get("thumbnail_path")
@@ -491,13 +650,15 @@ async def handle_single_track(
                         else None
                     )
                     try:
-                        is_video = audio_format == "mp4"
                         send_func = context.bot.send_video if is_video else context.bot.send_audio
                         kwargs = {
                             "chat_id": chat_id,
                             "duration": track_data.get("duration"),
                             "reply_to_message_id": reply_to,
                         }
+                        if switch_kb:
+                            kwargs["reply_markup"] = switch_kb
+
                         if is_video:
                             kwargs["video"] = audio_file
                             kwargs["caption"] = f"{track_data.get('title')} - {track_data.get('artist')}"
@@ -514,7 +675,7 @@ async def handle_single_track(
                         if thumb_file:
                             thumb_file.close()
 
-                # Save newly uploaded file_id into cache for instant delivery next time
+                # Save newly uploaded file_id permanently into cache
                 if video_id and sent_msg and (sent_msg.audio or sent_msg.video):
                     file_id = sent_msg.video.file_id if sent_msg.video else sent_msg.audio.file_id
                     await cache_manager.set(
@@ -524,11 +685,12 @@ async def handle_single_track(
                         artist=track_data.get("artist"),
                         duration=track_data.get("duration"),
                         format_id=audio_format,
+                        file_size=track_data.get("filesize", 0),
                     )
 
                 await safe_delete_message(status_msg)
             except Exception as exc:
-                logger.error(f"Failed to upload audio to Telegram: {exc}")
+                logger.error(f"Failed to upload media to Telegram: {exc}")
                 metrics.increment("downloads_failed")
                 await update_status_message(
                     status_msg, f"❌ *Upload failed:*\n`{str(exc)[:150]}`"
@@ -544,11 +706,62 @@ async def handle_playlist(
     context: ContextTypes.DEFAULT_TYPE,
     status_msg: telegram.Message,
     downloader: AudioDownloader,
+    requested_format: Optional[str] = None,
 ) -> None:
     """Handles downloading and uploading a YouTube playlist with pipelined streaming and cancellation."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else 0
-    audio_format, bitrate = await get_user_audio_format(user_id)
+
+    mode, default_audio_fmt, default_vid_fmt = await get_user_preferences(user_id)
+
+    if requested_format:
+        audio_format = requested_format
+    else:
+        if mode == "ask":
+            await update_status_message(status_msg, "🔎 *Extracting playlist metadata...*")
+            try:
+                playlist_info = await asyncio.to_thread(downloader.get_playlist_info, url)
+            except Exception as exc:
+                logger.error(f"Failed to extract playlist info for {url}: {exc}")
+                await update_status_message(
+                    status_msg, f"❌ *Failed to read playlist:*\n`{str(exc)[:150]}`"
+                )
+                return
+
+            title = playlist_info.get("title", "YouTube Playlist")
+            total = playlist_info.get("total_tracks", 0)
+
+            if total == 0:
+                await update_status_message(
+                    status_msg, "⚠️ *Playlist is empty or contains no accessible videos.*"
+                )
+                return
+
+            # Store short hash mapping for playlist URL
+            pl_key = hashlib.md5(url.encode()).hexdigest()[:16]
+            PENDING_PLAYLIST_URLS[pl_key] = url
+
+            text = (
+                f"📋 *Playlist detected:*\n"
+                f"*{title}* (`{total}` tracks)\n\n"
+                f"*How would you like to download this playlist?*"
+            )
+            await update_status_message(
+                status_msg,
+                text,
+                reply_markup=build_format_picker_keyboard(pl_key, is_playlist=True),
+            )
+            return
+        elif mode == "always_video":
+            audio_format = default_vid_fmt
+        elif mode == "always_audio":
+            audio_format = default_audio_fmt
+        else:
+            # Smart Auto default for playlists: default audio quality
+            audio_format = default_audio_fmt
+
+    bitrate = 192 if audio_format == "mp3_192" else (320 if audio_format == "mp3_320" else 0)
+    is_video = audio_format.startswith("mp4")
 
     # Register cancellation event for this chat
     cancel_event = asyncio.Event()
@@ -577,10 +790,11 @@ async def handle_playlist(
         ACTIVE_PLAYLIST_CANCELLATIONS.pop(chat_id, None)
         return
 
+    media_mode_str = "Video" if audio_format.startswith("mp4") else "Audio"
     is_radio = playlist_info.get("is_radio_mix", False)
     if is_radio:
         notice_text = (
-            f"📻 *YouTube Radio Mix detected:*\n"
+            f"📻 *YouTube Radio Mix detected ({media_mode_str}):*\n"
             f"*{title}* (capped at `{total}` tracks)\n\n"
             "ℹ️ _Note: Radio mixes are dynamically generated by YouTube and may differ from your current browser queue. "
             "To download an exact, fixed playlist, save it on YouTube first and share the saved `PL...` link._\n\n"
@@ -588,7 +802,7 @@ async def handle_playlist(
         )
     else:
         notice_text = (
-            f"📋 *Playlist detected:*\n*{title}* ({total} tracks)\n\n"
+            f"📋 *Playlist detected ({media_mode_str}):*\n*{title}* ({total} tracks)\n\n"
             "Starting pipelined download..."
         )
 
@@ -656,7 +870,7 @@ async def handle_playlist(
             if track_data.get("is_cached") and track_data.get("file_id"):
                 try:
                     await send_upload_action(context, chat_id)
-                    is_video = audio_format == "mp4"
+                    is_video = audio_format.startswith("mp4")
                     send_func = context.bot.send_video if is_video else context.bot.send_audio
                     kwargs = {
                         "chat_id": chat_id,
@@ -704,7 +918,7 @@ async def handle_playlist(
             thumb_path = track_data.get("thumbnail_path")
 
             try:
-                await send_upload_action(context, chat_id)
+                await send_upload_action(context, chat_id, is_video=is_video)
                 with open(audio_path, "rb") as audio_file:
                     thumb_file = (
                         open(thumb_path, "rb")
@@ -712,7 +926,7 @@ async def handle_playlist(
                         else None
                     )
                     try:
-                        is_video = audio_format == "mp4"
+                        is_video = audio_format.startswith("mp4")
                         send_func = context.bot.send_video if is_video else context.bot.send_audio
                         kwargs = {
                             "chat_id": chat_id,
@@ -735,7 +949,7 @@ async def handle_playlist(
                         if thumb_file:
                             thumb_file.close()
 
-                # Cache the newly uploaded track
+                # Cache the newly uploaded track permanently
                 track_id = track_data.get("id")
                 if track_id and sent_msg and (sent_msg.audio or sent_msg.video):
                     file_id = sent_msg.video.file_id if sent_msg.video else sent_msg.audio.file_id
@@ -746,6 +960,7 @@ async def handle_playlist(
                         artist=track_data.get("artist"),
                         duration=track_data.get("duration"),
                         format_id=audio_format,
+                        file_size=track_data.get("filesize", 0),
                     )
 
                 # Reposition the live progress dashboard below the newly uploaded audio track
@@ -819,6 +1034,34 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         downloader = AudioDownloader()
         await handle_single_track(url, update, context, status_msg, downloader)
 
+    elif data.startswith("fmt:"):
+        # Format selection for single track: fmt:<format>:<video_id>
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            chosen_fmt = parts[1]
+            video_id = parts[2]
+            url = f"https://www.youtube.com/watch?v={video_id}" if not video_id.startswith("http") else video_id
+            await query.answer(f"Selected {chosen_fmt.replace('mp4_', '').replace('mp3_', '')} format!")
+            status_msg = await query.message.reply_text(
+                "🔎 *Preparing media...*", parse_mode="Markdown"
+            )
+            downloader = AudioDownloader()
+            await handle_single_track(url, update, context, status_msg, downloader, requested_format=chosen_fmt)
+
+    elif data.startswith("plfmt:"):
+        # Format selection for playlist: plfmt:<format>:<playlist_key>
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            chosen_fmt = parts[1]
+            pl_key = parts[2]
+            url = PENDING_PLAYLIST_URLS.get(pl_key) or f"https://www.youtube.com/playlist?list={pl_key}"
+            await query.answer(f"Downloading playlist in {chosen_fmt}...")
+            status_msg = await query.message.reply_text(
+                "🔎 *Preparing playlist download...*", parse_mode="Markdown"
+            )
+            downloader = AudioDownloader()
+            await handle_playlist(url, update, context, status_msg, downloader, requested_format=chosen_fmt)
+
     elif data.startswith("cancel_pl:"):
         target_chat_id = int(data.split("cancel_pl:", 1)[1])
         event = ACTIVE_PLAYLIST_CANCELLATIONS.get(target_chat_id)
@@ -829,25 +1072,66 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             await query.answer("No active playlist download found to cancel.", show_alert=True)
 
-    elif data.startswith("set_fmt:"):
-        chosen_fmt = data.split("set_fmt:", 1)[1]
+    elif data.startswith("set_mode:"):
+        chosen_mode = data.split("set_mode:", 1)[1]
         user_id = update.effective_user.id if update.effective_user else 0
-        await cache_manager.set_user_setting(user_id, "audio_format", chosen_fmt)
-
-        fmt_names = {
-            "mp3_192": "MP3 (192 kbps)",
-            "mp3_320": "MP3 (320 kbps)",
-            "m4a": "M4A (Native Source Copy)",
-            "mp4": "MP4 (Video / Shorts)",
+        await cache_manager.set_user_setting(user_id, "download_mode", chosen_mode)
+        mode, audio_fmt, vid_fmt = await get_user_preferences(user_id)
+        mode_titles = {
+            "auto": "🤖 Smart Auto",
+            "ask": "⚡ Ask Every Time",
+            "always_audio": "🎵 Always Audio",
+            "always_video": "🎬 Always Video",
         }
-        name = fmt_names.get(chosen_fmt, chosen_fmt)
         try:
             await query.edit_message_reply_markup(
-                reply_markup=build_settings_keyboard(chosen_fmt)
+                reply_markup=build_settings_keyboard(mode, audio_fmt, vid_fmt)
             )
         except Exception:
             pass
-        await query.answer(f"Quality updated to {name}!")
+        await query.answer(f"Mode updated: {mode_titles.get(chosen_mode, chosen_mode)}!")
+
+    elif data.startswith("set_aud:"):
+        chosen_aud = data.split("set_aud:", 1)[1]
+        user_id = update.effective_user.id if update.effective_user else 0
+        await cache_manager.set_user_setting(user_id, "audio_format", chosen_aud)
+        mode, audio_fmt, vid_fmt = await get_user_preferences(user_id)
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=build_settings_keyboard(mode, audio_fmt, vid_fmt)
+            )
+        except Exception:
+            pass
+        await query.answer(f"Audio quality updated to {chosen_aud.replace('mp3_', '')} kbps!")
+
+    elif data.startswith("set_vid:"):
+        chosen_vid = data.split("set_vid:", 1)[1]
+        user_id = update.effective_user.id if update.effective_user else 0
+        await cache_manager.set_user_setting(user_id, "video_quality", chosen_vid)
+        mode, audio_fmt, vid_fmt = await get_user_preferences(user_id)
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=build_settings_keyboard(mode, audio_fmt, vid_fmt)
+            )
+        except Exception:
+            pass
+        await query.answer(f"Video quality updated to {chosen_vid.replace('mp4_', '')}p!")
+
+    elif data.startswith("set_fmt:"):
+        chosen_fmt = data.split("set_fmt:", 1)[1]
+        user_id = update.effective_user.id if update.effective_user else 0
+        if chosen_fmt.startswith("mp4"):
+            await cache_manager.set_user_setting(user_id, "video_quality", chosen_fmt)
+        else:
+            await cache_manager.set_user_setting(user_id, "audio_format", chosen_fmt)
+        mode, audio_fmt, vid_fmt = await get_user_preferences(user_id)
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=build_settings_keyboard(mode, audio_fmt, vid_fmt)
+            )
+        except Exception:
+            pass
+        await query.answer("Setting updated!")
 
     elif data == "cmd_settings":
         await query.answer()

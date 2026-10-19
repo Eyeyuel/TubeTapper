@@ -345,10 +345,23 @@ class AudioDownloader:
             ]
             format_spec = "ba[ext=m4a]/bestaudio/best"
             target_ext = "m4a"
-        elif chosen_format == "mp4":
+        elif chosen_format.startswith("mp4"):
             target_ext = "mp4"
             postprocessors = []
-            format_spec = "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+            
+            height_limit = 720  # default
+            if "480" in chosen_format:
+                height_limit = 480
+            elif "720" in chosen_format:
+                height_limit = 720
+            elif "1080" in chosen_format:
+                height_limit = 1080
+                
+            format_spec = (
+                f"bestvideo[ext=mp4][height<={height_limit}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={height_limit}]+bestaudio/"
+                f"best[ext=mp4][height<={height_limit}]/best[height<={height_limit}]/best"
+            )
         else:
             # Universal MP3 conversion at configured bitrate
             postprocessors = [
@@ -364,6 +377,7 @@ class AudioDownloader:
         ydl_opts = {
             "format": format_spec,
             "outtmpl": outtmpl,
+            "merge_output_format": "mp4" if target_ext == "mp4" else None,
             "postprocessors": postprocessors,
             "writethumbnail": True,
             "concurrent_fragment_downloads": 2,
@@ -397,22 +411,22 @@ class AudioDownloader:
             )
             duration = int(info.get("duration") or 0)
 
-            # Locate the output audio file
+            # Locate the output media file
             audio_path = target_dir / f"{video_id}.{target_ext}"
             if not audio_path.exists():
-                # Fallback: check for any audio file matching video_id in the directory
+                # Fallback: check for any audio/video file matching video_id in the directory
                 candidates = list(target_dir.glob(f"*{video_id}*.{target_ext}"))
                 if candidates:
                     audio_path = candidates[0]
                 else:
                     candidates_all = list(target_dir.glob(f"*{video_id}*.*"))
                     audio_candidates = [
-                        c for c in candidates_all if c.suffix in [".mp3", ".m4a", ".opus"]
+                        c for c in candidates_all if c.suffix in [".mp3", ".m4a", ".opus", ".mp4", ".mkv", ".webm"]
                     ]
                     if audio_candidates:
                         audio_path = audio_candidates[0]
                     else:
-                        raise FileNotFoundError(f"Expected audio file not found in {target_dir}")
+                        raise FileNotFoundError(f"Expected media file not found in {target_dir}")
 
             file_size = audio_path.stat().st_size
 

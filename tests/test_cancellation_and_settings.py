@@ -32,16 +32,26 @@ def test_render_progress_bar():
 
 
 def test_build_settings_keyboard():
-    """Test settings keyboard marks the active preference."""
-    kb_192 = build_settings_keyboard("mp3_192")
-    assert "✅" in kb_192.inline_keyboard[0][0].text
-    assert "✅" not in kb_192.inline_keyboard[1][0].text
+    """Test settings keyboard marks the active preferences across all 3 sections."""
+    # Test audio preference checkmarks (Row 2)
+    kb_192 = build_settings_keyboard("auto", "mp3_192", "mp4_720")
+    assert "✅" in kb_192.inline_keyboard[2][0].text
+    assert "✅" not in kb_192.inline_keyboard[2][1].text
 
-    kb_320 = build_settings_keyboard("mp3_320")
-    assert "✅" in kb_320.inline_keyboard[1][0].text
+    kb_320 = build_settings_keyboard("auto", "mp3_320", "mp4_720")
+    assert "✅" in kb_320.inline_keyboard[2][1].text
 
-    kb_m4a = build_settings_keyboard("m4a")
-    assert "✅" in kb_m4a.inline_keyboard[2][0].text
+    kb_m4a = build_settings_keyboard("auto", "m4a", "mp4_720")
+    assert "✅" in kb_m4a.inline_keyboard[2][2].text
+
+    # Test mode preference checkmarks (Row 0 & 1)
+    kb_ask = build_settings_keyboard("ask", "mp3_320", "mp4_720")
+    assert "✅" in kb_ask.inline_keyboard[0][1].text
+    assert "✅" not in kb_ask.inline_keyboard[0][0].text
+
+    # Test video quality checkmarks (Row 3)
+    kb_1080 = build_settings_keyboard("auto", "mp3_320", "mp4_1080")
+    assert "✅" in kb_1080.inline_keyboard[3][2].text
 
 
 def test_build_cancel_keyboard():
@@ -63,7 +73,7 @@ async def test_settings_command_renders_options():
     await settings_command(mock_update, mock_context)
     mock_update.effective_message.reply_text.assert_called_once()
     call_args = mock_update.effective_message.reply_text.call_args
-    assert "Audio Download Settings" in call_args[0][0]
+    assert "Download Settings" in call_args[0][0]
     assert call_args[1].get("reply_markup") is not None
 
 
@@ -132,3 +142,55 @@ async def test_callback_download_track():
         mock_handle.assert_called_once()
         args = mock_handle.call_args[0]
         assert "test_vid_xyz" in args[0]
+
+
+def test_build_format_picker_and_delivery_switch_keyboards():
+    """Test 6-button format picker and 1-tap delivery quick switch keyboards."""
+    from bot import build_format_picker_keyboard, build_delivery_switch_keyboard
+
+    # Format picker for single track (fmt: prefix)
+    single_kb = build_format_picker_keyboard("vid_123", is_playlist=False)
+    assert len(single_kb.inline_keyboard) == 2
+    assert "fmt:mp3_320:vid_123" in single_kb.inline_keyboard[0][1].callback_data
+    assert "fmt:mp4_720:vid_123" in single_kb.inline_keyboard[1][1].callback_data
+
+    # Format picker for playlist (plfmt: prefix)
+    pl_kb = build_format_picker_keyboard("pl_abc", is_playlist=True)
+    assert "plfmt:mp3_320:pl_abc" in pl_kb.inline_keyboard[0][1].callback_data
+    assert "plfmt:mp4_1080:pl_abc" in pl_kb.inline_keyboard[1][2].callback_data
+
+    # Delivery switch when delivered as video -> offers audio extraction
+    vid_delivered_kb = build_delivery_switch_keyboard("vid_123", current_format="mp4_720")
+    assert "fmt:mp3_320:vid_123" in vid_delivered_kb.inline_keyboard[0][0].callback_data
+    assert "Extract" in vid_delivered_kb.inline_keyboard[0][0].text
+
+    # Delivery switch when delivered as audio -> offers video download
+    aud_delivered_kb = build_delivery_switch_keyboard("vid_123", current_format="mp3_320")
+    assert "fmt:mp4_720:vid_123" in aud_delivered_kb.inline_keyboard[0][0].callback_data
+    assert "Video" in aud_delivered_kb.inline_keyboard[0][0].text
+
+
+@pytest.mark.asyncio
+async def test_callback_mode_and_quality_updates():
+    """Test callback queries for set_mode and set_vid."""
+    from bot import get_user_preferences
+
+    mock_update = MagicMock()
+    mock_update.effective_user.id = 888
+    mock_query = MagicMock()
+    mock_query.answer = AsyncMock()
+    mock_query.edit_message_reply_markup = AsyncMock()
+    mock_update.callback_query = mock_query
+    mock_context = MagicMock()
+
+    # Test set_mode
+    mock_query.data = "set_mode:ask"
+    await handle_callback_query(mock_update, mock_context)
+    mode, _, _ = await get_user_preferences(888)
+    assert mode == "ask"
+
+    # Test set_vid
+    mock_query.data = "set_vid:mp4_1080"
+    await handle_callback_query(mock_update, mock_context)
+    _, _, vid = await get_user_preferences(888)
+    assert vid == "mp4_1080"
