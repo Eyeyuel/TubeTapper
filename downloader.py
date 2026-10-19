@@ -100,12 +100,26 @@ class AudioDownloader:
         return None
 
     def _apply_network_options(self, opts: Dict[str, Any]) -> Dict[str, Any]:
-        """Injects cookies file and rotating proxy settings if configured."""
+        """Injects cookies file, rotating proxy settings, and anti-bot mobile player clients."""
+        # 1. Automatic cookie discovery
         if self.config.youtube_cookies_file and Path(self.config.youtube_cookies_file).exists():
             opts["cookiefile"] = str(self.config.youtube_cookies_file)
+        elif Path("/app/cookies.txt").exists():
+            opts["cookiefile"] = "/app/cookies.txt"
+        elif Path("cookies.txt").exists():
+            opts["cookiefile"] = "cookies.txt"
+
+        # 2. Proxy configuration
         active_proxy = proxy_manager.get_proxy() or self.config.youtube_proxy
         if active_proxy:
             opts["proxy"] = str(active_proxy)
+
+        # 3. Bypass YouTube bot verification / 429 sign-in via mobile player clients
+        extractor_args = opts.setdefault("extractor_args", {})
+        youtube_args = extractor_args.setdefault("youtube", {})
+        if "player_client" not in youtube_args:
+            youtube_args["player_client"] = ["android", "ios"]
+
         return opts
 
     def search_youtube(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
@@ -648,3 +662,16 @@ class AudioDownloader:
                     logger.debug(f"Removed temporary file: {path_obj}")
             except Exception as e:
                 logger.warning(f"Failed to remove file {p}: {e}")
+
+
+def format_download_error(exc: Exception) -> str:
+    """Formats raw yt-dlp / ffmpeg exceptions into user-friendly Telegram markdown."""
+    err_str = str(exc)
+    if "confirm you’re not a bot" in err_str or "Sign in to confirm" in err_str:
+        return "❌ *Download blocked by YouTube.*\nYouTube is requiring bot verification for this track. Please try another link or configure cookies."
+    if "Private video" in err_str:
+        return "❌ *Download failed:*\nThis video is private on YouTube."
+    if "Join this channel" in err_str or "members-only" in err_str.lower():
+        return "❌ *Download failed:*\nThis video requires channel membership."
+    return f"❌ *Download failed:*\n`{err_str[:150]}`"
+

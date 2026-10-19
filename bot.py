@@ -32,7 +32,7 @@ from telegram.ext import (
 )
 
 from config import config
-from downloader import AudioDownloader
+from downloader import AudioDownloader, format_download_error
 from helpers.cache import cache_manager
 from helpers.cleanup import cleanup_orphaned_downloads
 from helpers.logger import setup_logger
@@ -610,7 +610,7 @@ async def handle_single_track(
                 logger.error(f"Download error for {url}: {exc}")
                 metrics.increment("downloads_failed")
                 await update_status_message(
-                    status_msg, f"❌ *Download failed:*\n`{str(exc)[:150]}`"
+                    status_msg, format_download_error(exc)
                 )
                 return
 

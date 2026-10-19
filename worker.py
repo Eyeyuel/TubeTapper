@@ -8,7 +8,7 @@ import telegram
 from telegram.constants import ChatAction
 
 from config import config
-from downloader import AudioDownloader
+from downloader import AudioDownloader, format_download_error
 from helpers.cache import cache_manager
 from helpers.cleanup import cleanup_orphaned_downloads
 from helpers.logger import setup_logger
@@ -82,7 +82,7 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=status_msg_id,
-                    text=f"❌ *Download failed:*\n`{str(exc)[:150]}`",
+                    text=format_download_error(exc),
                     parse_mode="Markdown",
                 )
             except Exception:
