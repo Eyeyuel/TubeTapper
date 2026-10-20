@@ -116,6 +116,8 @@ class AudioCacheManager:
                         FROM audio_cache;
                         """
                     )
+                    # Clean up any video formats from legacy audio_cache table so it remains audio-only
+                    conn.execute("DELETE FROM audio_cache WHERE video_id LIKE '%_mp4%'")
                 except Exception as mig_exc:
                     logger.debug(f"Cache migration notice: {mig_exc}")
 
@@ -183,13 +185,14 @@ class AudioCacheManager:
         return result
 
     def _get_sqlite(self, video_id: str, format_id: str = "mp3") -> Optional[Dict[str, Any]]:
-        """Synchronous SQLite cache lookup with permanent persistence."""
+        """Synchronous SQLite cache lookup with strict format isolation and permanent persistence."""
         cache_key = f"{video_id}_{format_id}"
+        is_video_request = format_id.startswith("mp4")
         try:
             with sqlite3.connect(self.sqlite_path) as conn:
                 cursor = conn.cursor()
 
-                # 1. Query media_cache by composite key
+                # 1. Exact match in media_cache by composite primary key (video_id, format_id)
                 cursor.execute(
                     """
                     SELECT file_id, title, artist, duration, file_size, created_at 
@@ -200,10 +203,21 @@ class AudioCacheManager:
                 )
                 row = cursor.fetchone()
 
-                # 2. Fallback: check other MP3 bitrates / generic mp3 in media_cache
-                if not row and format_id.startswith("mp3"):
-                    for alt in ("mp3", "mp3_320", "mp3_192"):
-                        if alt != format_id:
+                # 2. Controlled fallbacks ONLY for generic formats (never cross audio/video boundaries)
+                if not row:
+                    if format_id == "mp3":
+                        # If generic MP3 requested without bitrate, match any existing MP3 bitrate in media_cache
+                        for alt in ("mp3_320", "mp3_192"):
+                            cursor.execute(
+                                "SELECT file_id, title, artist, duration, file_size, created_at FROM media_cache WHERE video_id = ? AND format_id = ?",
+                                (video_id, alt),
+                            )
+                            row = cursor.fetchone()
+                            if row:
+                                break
+                    elif format_id == "mp4":
+                        # If generic MP4 requested without resolution, match any video resolution in media_cache
+                        for alt in ("mp4_720", "mp4_1080", "mp4_480"):
                             cursor.execute(
                                 "SELECT file_id, title, artist, duration, file_size, created_at FROM media_cache WHERE video_id = ? AND format_id = ?",
                                 (video_id, alt),
@@ -212,38 +226,28 @@ class AudioCacheManager:
                             if row:
                                 break
 
-                # 3. Fallback: check legacy audio_cache table
-                if not row:
+                # 3. Check legacy audio_cache table ONLY for audio requests (never for videos)
+                if not row and not is_video_request:
+                    # Check exact composite key in audio_cache
                     cursor.execute(
                         "SELECT file_id, title, artist, duration, 0, created_at FROM audio_cache WHERE video_id = ?",
                         (cache_key,),
                     )
                     row = cursor.fetchone()
 
-                if not row and format_id.startswith("mp3"):
-                    for alt in ("mp3", "mp3_320", "mp3_192"):
-                        cursor.execute(
-                            "SELECT file_id, title, artist, duration, 0, created_at FROM audio_cache WHERE video_id = ?",
-                            (f"{video_id}_{alt}",),
-                        )
-                        row = cursor.fetchone()
-                        if row:
-                            break
-
-                # 4. Fallback: check bare video_id in media_cache and audio_cache
-                if not row:
-                    cursor.execute(
-                        "SELECT file_id, title, artist, duration, file_size, created_at FROM media_cache WHERE video_id = ?",
-                        (video_id,),
-                    )
-                    row = cursor.fetchone()
-
-                if not row:
-                    cursor.execute(
-                        "SELECT file_id, title, artist, duration, 0, created_at FROM audio_cache WHERE video_id = ?",
-                        (video_id,),
-                    )
-                    row = cursor.fetchone()
+                    # For MP3 requests, check legacy MP3 bitrates or bare legacy video_id
+                    if not row and format_id.startswith("mp3"):
+                        candidates = [f"{video_id}_mp3"]
+                        if format_id == "mp3":
+                            candidates.extend([f"{video_id}_mp3_320", f"{video_id}_mp3_192", video_id])
+                        for alt in candidates:
+                            cursor.execute(
+                                "SELECT file_id, title, artist, duration, 0, created_at FROM audio_cache WHERE video_id = ?",
+                                (alt,),
+                            )
+                            row = cursor.fetchone()
+                            if row:
+                                break
 
                 if not row:
                     return None
@@ -330,21 +334,22 @@ class AudioCacheManager:
                     ),
                 )
 
-                # Maintain legacy audio_cache table for backwards compatibility
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO audio_cache (video_id, file_id, title, artist, duration, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        cache_key,
-                        record["file_id"],
-                        record["title"],
-                        record["artist"],
-                        record["duration"],
-                        record["created_at"],
-                    ),
-                )
+                # Maintain legacy audio_cache table for backwards compatibility ONLY for audio formats
+                if not format_id.startswith("mp4"):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO audio_cache (video_id, file_id, title, artist, duration, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            cache_key,
+                            record["file_id"],
+                            record["title"],
+                            record["artist"],
+                            record["duration"],
+                            record["created_at"],
+                        ),
+                    )
                 conn.commit()
                 logger.debug(f"Saved {video_id} ({format_id}) to permanent SQLite cache.")
         except Exception as exc:
@@ -378,11 +383,11 @@ class AudioCacheManager:
                 logger.debug(f"Redis lock acquisition error: {exc}")
                 acquired = True
         else:
-            # Local in-memory lock fallback
+            # Local in-memory lock fallback isolated by format
             async with self._lock_dict_mutex:
-                if video_id not in self._local_locks:
-                    self._local_locks[video_id] = asyncio.Lock()
-                lock = self._local_locks[video_id]
+                if cache_key not in self._local_locks:
+                    self._local_locks[cache_key] = asyncio.Lock()
+                lock = self._local_locks[cache_key]
 
             await lock.acquire()
             acquired = True
@@ -397,7 +402,7 @@ class AudioCacheManager:
                     pass
             elif not self._is_redis_active and acquired:
                 async with self._lock_dict_mutex:
-                    lock = self._local_locks.get(video_id)
+                    lock = self._local_locks.get(cache_key)
                     if lock and lock.locked():
                         lock.release()
 

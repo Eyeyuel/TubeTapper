@@ -152,3 +152,44 @@ async def test_redis_cache_operations(tmp_path):
 
         await cache.close()
         assert not cache.is_redis_active
+
+
+@pytest.mark.asyncio
+async def test_cache_format_isolation_no_cross_contamination(tmp_path):
+    """Test that caching one format (e.g. 1080p video) never cross-pollinates other formats or audio."""
+    cache = AudioCacheManager(redis_url="", cache_dir=tmp_path)
+    await cache.initialize()
+
+    vid = "jynxzi_test_vid"
+
+    # 1. Initially nothing cached
+    assert await cache.get(vid, format_id="mp4_1080") is None
+    assert await cache.get(vid, format_id="mp3_320") is None
+
+    # 2. Cache 1080p video
+    await cache.set(vid, file_id="FILE_1080P_VIDEO", title="Jynxzi Clip", format_id="mp4_1080")
+
+    # 3. Exact 1080p matches
+    res_1080 = await cache.get(vid, format_id="mp4_1080")
+    assert res_1080 is not None
+    assert res_1080["file_id"] == "FILE_1080P_VIDEO"
+
+    # 4. Strict isolation: different resolutions and audio formats MUST return None
+    assert await cache.get(vid, format_id="mp4_480") is None
+    assert await cache.get(vid, format_id="mp4_720") is None
+    assert await cache.get(vid, format_id="mp3_320") is None
+    assert await cache.get(vid, format_id="mp3_192") is None
+    assert await cache.get(vid, format_id="m4a") is None
+
+    # 5. Cache MP3 320k for the same video
+    await cache.set(vid, file_id="FILE_320K_AUDIO", title="Jynxzi Audio", format_id="mp3_320")
+
+    # 6. Both coexist independently without conflict
+    res_audio = await cache.get(vid, format_id="mp3_320")
+    res_video = await cache.get(vid, format_id="mp4_1080")
+    assert res_audio is not None and res_audio["file_id"] == "FILE_320K_AUDIO"
+    assert res_video is not None and res_video["file_id"] == "FILE_1080P_VIDEO"
+
+    # 7. Native M4A and 480p remain uncached
+    assert await cache.get(vid, format_id="m4a") is None
+    assert await cache.get(vid, format_id="mp4_480") is None

@@ -221,12 +221,12 @@ def build_format_picker_keyboard(media_id: str, is_playlist: bool = False) -> In
     keyboard = [
         [
             InlineKeyboardButton("🎵 MP3 192k", callback_data=f"{prefix}:mp3_192:{media_id}"),
-            InlineKeyboardButton("🎧 MP3 320k", callback_data=f"{prefix}:mp3_320:{media_id}"),
+            InlineKeyboardButton("🎧 MP3 320k", callback_data=f"{prefix}:mp3_320:{media_id}", style="primary"),
             InlineKeyboardButton("⚡ M4A Native", callback_data=f"{prefix}:m4a:{media_id}"),
         ],
         [
             InlineKeyboardButton("🎬 480p Fast", callback_data=f"{prefix}:mp4_480:{media_id}"),
-            InlineKeyboardButton("🎬 720p HD", callback_data=f"{prefix}:mp4_720:{media_id}"),
+            InlineKeyboardButton("🎬 720p HD", callback_data=f"{prefix}:mp4_720:{media_id}", style="primary"),
             InlineKeyboardButton("🎬 1080p FHD", callback_data=f"{prefix}:mp4_1080:{media_id}"),
         ],
     ]
@@ -538,6 +538,8 @@ async def handle_single_track(
 
     bitrate = 192 if audio_format == "mp3_192" else (320 if audio_format == "mp3_320" else 0)
     is_video = audio_format.startswith("mp4")
+    media_label = "Video" if is_video else "Audio"
+    fmt_tag = audio_format.replace("mp4_", "").replace("mp3_", "").upper()
 
     metrics.increment("downloads_total")
 
@@ -549,10 +551,9 @@ async def handle_single_track(
         try:
             cached = await cache_manager.get(video_id, audio_format)
             if cached and cached.get("file_id"):
-                media_type = "video" if is_video else "audio"
-                logger.info(f"Delivering cached {media_type} for video ID {video_id}")
+                logger.info(f"Delivering cached {media_label} ({fmt_tag}) for video ID {video_id}")
                 metrics.increment("downloads_cached")
-                await update_status_message(status_msg, f"⚡ *Found in cache! Delivering {media_type}...*")
+                await update_status_message(status_msg, f"⚡ *Found in cache! Delivering {media_label} ({fmt_tag})...*")
                 await send_upload_action(context, chat_id, is_video=is_video)
                 send_func = context.bot.send_video if is_video else context.bot.send_audio
                 kwargs = {
@@ -585,10 +586,9 @@ async def handle_single_track(
             try:
                 cached = await cache_manager.get(video_id, audio_format)
                 if cached and cached.get("file_id"):
-                    media_type = "video" if is_video else "audio"
-                    logger.info(f"Delivering cached {media_type} (post-lock) for video ID {video_id}")
+                    logger.info(f"Delivering cached {media_label} ({fmt_tag}, post-lock) for video ID {video_id}")
                     metrics.increment("downloads_cached")
-                    await update_status_message(status_msg, f"⚡ *Found in cache! Delivering {media_type}...*")
+                    await update_status_message(status_msg, f"⚡ *Found in cache! Delivering {media_label} ({fmt_tag})...*")
                     await send_upload_action(context, chat_id, is_video=is_video)
                     send_func = context.bot.send_video if is_video else context.bot.send_audio
                     kwargs = {
@@ -618,7 +618,7 @@ async def handle_single_track(
             redis_pool = context.application.bot_data.get("arq_pool") if context and context.application else None
             if redis_pool:
                 try:
-                    await update_status_message(status_msg, "⏳ *Queued in high-speed worker pool...*")
+                    await update_status_message(status_msg, f"⏳ *Queued in worker pool ({media_label} {fmt_tag})...*")
                     await redis_pool.enqueue_job(
                         "process_download_job",
                         {
@@ -630,7 +630,7 @@ async def handle_single_track(
                             "status_message_id": status_msg.message_id if status_msg else None,
                         },
                     )
-                    logger.info(f"Dispatched download for {url} to distributed worker queue.")
+                    logger.info(f"Dispatched download for {url} ({audio_format}) to distributed worker queue.")
                     return
                 except Exception as exc:
                     logger.warning(
@@ -649,8 +649,7 @@ async def handle_single_track(
             )
 
         async with queue_manager.acquire_slot(notify_callback=notify_queue_position):
-            media_type = "video" if is_video else "audio track"
-            await update_status_message(status_msg, f"⬇️ *Downloading {media_type}...*")
+            await update_status_message(status_msg, f"⬇️ *Downloading {media_label} ({fmt_tag})...*")
 
             try:
                 track_data = await asyncio.to_thread(
@@ -670,7 +669,6 @@ async def handle_single_track(
                 downloader.cleanup_files(
                     track_data.get("file_path"), track_data.get("thumbnail_path")
                 )
-                media_name = "Video" if is_video else "Audio"
                 retry_kb = None
                 if is_video and "480" not in audio_format and video_id:
                     retry_kb = InlineKeyboardMarkup([
@@ -678,15 +676,14 @@ async def handle_single_track(
                     ])
                 await update_status_message(
                     status_msg,
-                    f"⚠️ *File too large:*\n{media_name} file is {size_mb} MB, which exceeds "
+                    f"⚠️ *File too large:*\n{media_label} file is {size_mb} MB, which exceeds "
                     f"Telegram's {config.max_file_size_mb} MB limit.\n\n"
                     f"> 💡 *Tip:* Try downloading in 480p or Audio (MP3) for a much smaller file size.",
                     reply_markup=retry_kb,
                 )
                 return
 
-            media_label = "video" if is_video else "audio"
-            await update_status_message(status_msg, f"📤 *Uploading {media_label} to Telegram...*")
+            await update_status_message(status_msg, f"📤 *Uploading {media_label} ({fmt_tag}) to Telegram...*")
             await send_upload_action(context, chat_id, is_video=is_video)
 
             audio_path = track_data["file_path"]
@@ -1091,9 +1088,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             chosen_fmt = parts[1]
             video_id = parts[2]
             url = f"https://www.youtube.com/watch?v={video_id}" if not video_id.startswith("http") else video_id
-            await query.answer(f"Selected {chosen_fmt.replace('mp4_', '').replace('mp3_', '')} format!")
+            fmt_clean = chosen_fmt.replace("mp4_", "").replace("mp3_", "").upper()
+            media_kind = "Video" if chosen_fmt.startswith("mp4") else "Audio"
+            await query.answer(f"Preparing {media_kind} ({fmt_clean})...")
             status_msg = await query.message.reply_text(
-                "🔎 *Preparing media...*", parse_mode="Markdown"
+                f"🔎 *Preparing {media_kind} ({fmt_clean})...*", parse_mode="Markdown"
             )
             downloader = AudioDownloader()
             await handle_single_track(url, update, context, status_msg, downloader, requested_format=chosen_fmt)
@@ -1105,9 +1104,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             chosen_fmt = parts[1]
             pl_key = parts[2]
             url = PENDING_PLAYLIST_URLS.get(pl_key) or f"https://www.youtube.com/playlist?list={pl_key}"
-            await query.answer(f"Downloading playlist in {chosen_fmt}...")
+            fmt_clean = chosen_fmt.replace("mp4_", "").replace("mp3_", "").upper()
+            media_kind = "Video" if chosen_fmt.startswith("mp4") else "Audio"
+            await query.answer(f"Preparing {media_kind} ({fmt_clean}) playlist...")
             status_msg = await query.message.reply_text(
-                "🔎 *Preparing playlist download...*", parse_mode="Markdown"
+                f"🔎 *Preparing {media_kind} ({fmt_clean}) playlist download...*", parse_mode="Markdown"
             )
             downloader = AudioDownloader()
             await handle_playlist(url, update, context, status_msg, downloader, requested_format=chosen_fmt)
