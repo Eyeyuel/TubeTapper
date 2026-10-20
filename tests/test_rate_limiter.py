@@ -93,3 +93,66 @@ async def test_restricted_decorator_exempt_handlers():
 
     # Clean up
     rate_limiter.reset(77777)
+
+
+@pytest.mark.asyncio
+async def test_ui_callbacks_exempt_from_rate_limit():
+    """Verify that settings buttons and other UI callbacks are completely exempt from rate limiting."""
+    mock_func = AsyncMock(return_value="UI_CLICK_OK")
+    decorated = restricted(mock_func, check_rate_limit=True)
+
+    user_id = 66666
+    # Exhaust rate limit completely for this user
+    rate_limiter.reset(user_id)
+    for _ in range(rate_limiter.max_requests):
+        rate_limiter.is_allowed(user_id)
+
+    # Test settings callbacks: set_mode, set_aud, set_vid, cancel_pl, cmd_settings
+    test_callbacks = [
+        "set_mode:ask",
+        "set_aud:mp3_320",
+        "set_vid:mp4_1080",
+        "cancel_pl:1234",
+        "cmd_settings",
+        "cmd_help",
+    ]
+
+    for cb_data in test_callbacks:
+        mock_update = MagicMock()
+        mock_update.effective_user.id = user_id
+        mock_update.callback_query.data = cb_data
+        mock_context = MagicMock()
+
+        res = await decorated(mock_update, mock_context)
+        assert res == "UI_CLICK_OK", f"UI callback {cb_data} should be exempt from rate limiting"
+
+    # Clean up
+    rate_limiter.reset(user_id)
+
+
+@pytest.mark.asyncio
+async def test_download_callbacks_still_rate_limited():
+    """Verify that actual heavy download callbacks (dl:, fmt:, plfmt:) are still protected by rate limiting."""
+    mock_func = AsyncMock(return_value="DOWNLOAD_INIT")
+    decorated = restricted(mock_func, check_rate_limit=True)
+
+    user_id = 55555
+    # Exhaust rate limit
+    rate_limiter.reset(user_id)
+    for _ in range(rate_limiter.max_requests):
+        rate_limiter.is_allowed(user_id)
+
+    mock_update = MagicMock()
+    mock_update.effective_user.id = user_id
+    mock_update.callback_query.data = "fmt:mp4_720:vid123"
+    mock_update.effective_message.reply_text = AsyncMock()
+    mock_context = MagicMock()
+
+    res = await decorated(mock_update, mock_context)
+    assert res is None, "Heavy download callback should be blocked when user exceeds rate limit"
+    mock_update.effective_message.reply_text.assert_called_once()
+    assert "going a bit too fast" in mock_update.effective_message.reply_text.call_args[0][0]
+
+    # Clean up
+    rate_limiter.reset(user_id)
+

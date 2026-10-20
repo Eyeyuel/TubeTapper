@@ -293,11 +293,12 @@ def restricted(func: Optional[Callable] = None, *, check_rate_limit: bool = True
                     )
                 return None
 
-            # Exempt UI buttons like settings and cancel from rate limiting
+            # Exempt non-download UI interactions (settings toggles, help, cancellations, etc.)
             exempt_from_rate_limit = False
             if update.callback_query and update.callback_query.data:
                 cb_data = update.callback_query.data
-                if cb_data.startswith("set_fmt:") or cb_data.startswith("cancel_pl:"):
+                # Only actual heavy download initiators (dl:, fmt:, plfmt:) consume rate limit tokens
+                if not (cb_data.startswith("dl:") or cb_data.startswith("fmt:") or cb_data.startswith("plfmt:")):
                     exempt_from_rate_limit = True
 
             if check_rate_limit and user and not exempt_from_rate_limit:
@@ -403,7 +404,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.effective_message.reply_text(text, parse_mode="Markdown")
 
 
-@restricted
+@restricted(check_rate_limit=False)
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Lets user customize preferred download mode, audio bitrate, and video resolution."""
     if not update.effective_message or not update.effective_user:

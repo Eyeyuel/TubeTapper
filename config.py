@@ -42,7 +42,7 @@ class AppConfig:
     webhook_secret: Optional[str] = None
     youtube_proxy_pool: Optional[str] = None
     worker_mode: bool = False
-    user_rate_limit: int = 5
+    user_rate_limit: int = 15
     user_rate_window: int = 60
 
     @property
@@ -170,9 +170,9 @@ def load_config() -> AppConfig:
     worker_mode = raw_worker_mode in ("true", "1", "yes")
 
     try:
-        user_rate_limit = int(os.getenv("USER_RATE_LIMIT", "5").strip())
+        user_rate_limit = int(os.getenv("USER_RATE_LIMIT", "15").strip())
     except ValueError:
-        user_rate_limit = 5
+        user_rate_limit = 15
 
     try:
         user_rate_window = int(os.getenv("USER_RATE_WINDOW", "60").strip())
