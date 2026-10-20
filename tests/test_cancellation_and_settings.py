@@ -11,6 +11,7 @@ from bot import (
     handle_callback_query,
     settings_command,
     get_user_audio_format,
+    get_user_preferences,
 )
 from helpers.progress import render_progress_bar
 from helpers.cache import cache_manager
@@ -32,33 +33,35 @@ def test_render_progress_bar():
 
 
 def test_build_settings_keyboard():
-    """Test settings keyboard marks the active preferences across all 3 sections."""
-    # Test audio preference checkmarks (Row 2)
+    """Test settings keyboard styles active preferences with style='success' across all 3 sections."""
+    # Test audio preference styles (Row 2)
     kb_192 = build_settings_keyboard("auto", "mp3_192", "mp4_720")
-    assert "✅" in kb_192.inline_keyboard[2][0].text
-    assert "✅" not in kb_192.inline_keyboard[2][1].text
+    assert kb_192.inline_keyboard[2][0].style == "success"
+    assert kb_192.inline_keyboard[2][1].style is None
 
     kb_320 = build_settings_keyboard("auto", "mp3_320", "mp4_720")
-    assert "✅" in kb_320.inline_keyboard[2][1].text
+    assert kb_320.inline_keyboard[2][1].style == "success"
 
     kb_m4a = build_settings_keyboard("auto", "m4a", "mp4_720")
-    assert "✅" in kb_m4a.inline_keyboard[2][2].text
+    assert kb_m4a.inline_keyboard[2][2].style == "success"
 
-    # Test mode preference checkmarks (Row 0 & 1)
+    # Test mode preference styles (Row 0 & 1)
     kb_ask = build_settings_keyboard("ask", "mp3_320", "mp4_720")
-    assert "✅" in kb_ask.inline_keyboard[0][1].text
-    assert "✅" not in kb_ask.inline_keyboard[0][0].text
+    assert kb_ask.inline_keyboard[0][1].style == "success"
+    assert kb_ask.inline_keyboard[0][0].style is None
 
-    # Test video quality checkmarks (Row 3)
+    # Test video quality styles (Row 3)
     kb_1080 = build_settings_keyboard("auto", "mp3_320", "mp4_1080")
-    assert "✅" in kb_1080.inline_keyboard[3][2].text
+    assert kb_1080.inline_keyboard[3][2].style == "success"
+    assert kb_1080.inline_keyboard[3][0].style is None
 
 
 def test_build_cancel_keyboard():
-    """Test playlist cancel keyboard."""
+    """Test playlist cancel keyboard has danger red style."""
     kb = build_cancel_keyboard(9988)
     assert len(kb.inline_keyboard) == 1
     assert kb.inline_keyboard[0][0].callback_data == "cancel_pl:9988"
+    assert kb.inline_keyboard[0][0].style == "danger"
     assert "Cancel" in kb.inline_keyboard[0][0].text
 
 
@@ -159,15 +162,17 @@ def test_build_format_picker_and_delivery_switch_keyboards():
     assert "plfmt:mp3_320:pl_abc" in pl_kb.inline_keyboard[0][1].callback_data
     assert "plfmt:mp4_1080:pl_abc" in pl_kb.inline_keyboard[1][2].callback_data
 
-    # Delivery switch when delivered as video -> offers audio extraction
+    # Delivery switch when delivered as video -> offers audio extraction with primary style
     vid_delivered_kb = build_delivery_switch_keyboard("vid_123", current_format="mp4_720")
     assert "fmt:mp3_320:vid_123" in vid_delivered_kb.inline_keyboard[0][0].callback_data
     assert "Extract" in vid_delivered_kb.inline_keyboard[0][0].text
+    assert vid_delivered_kb.inline_keyboard[0][0].style == "primary"
 
-    # Delivery switch when delivered as audio -> offers video download
+    # Delivery switch when delivered as audio -> offers video download with primary style
     aud_delivered_kb = build_delivery_switch_keyboard("vid_123", current_format="mp3_320")
     assert "fmt:mp4_720:vid_123" in aud_delivered_kb.inline_keyboard[0][0].callback_data
     assert "Video" in aud_delivered_kb.inline_keyboard[0][0].text
+    assert aud_delivered_kb.inline_keyboard[0][0].style == "primary"
 
 
 @pytest.mark.asyncio
@@ -194,3 +199,21 @@ async def test_callback_mode_and_quality_updates():
     await handle_callback_query(mock_update, mock_context)
     _, _, vid = await get_user_preferences(888)
     assert vid == "mp4_1080"
+
+
+@pytest.mark.asyncio
+async def test_legacy_format_migration_and_video_quality_persistence():
+    """Verify that old mp4 stored in audio_format is cleaned up and does not overwrite video_quality."""
+    user_id = 999111
+    # Simulate legacy state: audio_format has mp4_1080, and video_quality was just chosen as mp4_480
+    await cache_manager.set_user_setting(user_id, "audio_format", "mp4_1080")
+    await cache_manager.set_user_setting(user_id, "video_quality", "mp4_480")
+
+    mode, audio_fmt, vid_fmt = await get_user_preferences(user_id)
+    assert vid_fmt == "mp4_480", "Explicit video_quality must NOT be overwritten by old audio_format"
+    assert audio_fmt == "mp3_320", "Legacy audio_format must be normalized to mp3_320"
+
+    # Verify settings keyboard renders green on 480p
+    kb = build_settings_keyboard(mode, audio_fmt, vid_fmt)
+    assert kb.inline_keyboard[3][0].style == "success"  # 480p is green
+    assert kb.inline_keyboard[3][2].style is None       # 1080p is unselected

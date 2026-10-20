@@ -87,13 +87,22 @@ async def get_user_preferences(user_id: int) -> Tuple[str, str, str]:
     """
     mode = await cache_manager.get_user_setting(user_id, "download_mode", "auto")
     audio_fmt = await cache_manager.get_user_setting(user_id, "audio_format", "mp3_320")
-    vid_fmt = await cache_manager.get_user_setting(user_id, "video_quality", "mp4_720")
+    vid_fmt = await cache_manager.get_user_setting(user_id, "video_quality", None)
 
-    # Normalize legacy formats if stored in user preferences
+    # 1. Handle legacy stored video format in audio_format
     if audio_fmt in ("mp4", "mp4_480", "mp4_720", "mp4_1080"):
-        vid_fmt = "mp4_720" if audio_fmt == "mp4" else audio_fmt
+        # If user had no explicit video_quality, migrate it once
+        if vid_fmt is None:
+            vid_fmt = "mp4_720" if audio_fmt == "mp4" else audio_fmt
+            if user_id:
+                asyncio.create_task(cache_manager.set_user_setting(user_id, "video_quality", vid_fmt))
+        # Reset audio_format back to valid default audio format and persist cleanup
         audio_fmt = "mp3_320"
-    if vid_fmt not in ("mp4_480", "mp4_720", "mp4_1080"):
+        if user_id:
+            asyncio.create_task(cache_manager.set_user_setting(user_id, "audio_format", "mp3_320"))
+
+    # 2. Default video quality fallback if unset
+    if not vid_fmt or vid_fmt not in ("mp4_480", "mp4_720", "mp4_1080"):
         vid_fmt = "mp4_720"
 
     return mode, audio_fmt, vid_fmt
@@ -117,7 +126,7 @@ def build_settings_keyboard(
     audio_fmt: Optional[str] = None,
     vid_fmt: Optional[str] = None,
 ) -> InlineKeyboardMarkup:
-    """Builds inline keyboard for settings divided into 3 distinct sections with independent checkmarks."""
+    """Builds inline keyboard for settings divided into 3 distinct sections using native Telegram colored buttons."""
     if audio_fmt is None and vid_fmt is None:
         if mode_or_pref in ("auto", "ask", "always_audio", "always_video"):
             mode = mode_or_pref
@@ -141,26 +150,66 @@ def build_settings_keyboard(
         vid = vid_fmt or "mp4_720"
 
     keyboard = [
-        # Section 1: Download Mode
+        # Section 1: Download Mode (Selected mode turns solid green via style="success")
         [
-            InlineKeyboardButton(f"🤖 Smart Auto{' ✅' if mode == 'auto' else ''}", callback_data="set_mode:auto"),
-            InlineKeyboardButton(f"⚡ Ask Every Time{' ✅' if mode == 'ask' else ''}", callback_data="set_mode:ask"),
+            InlineKeyboardButton(
+                "🤖 Smart Auto",
+                callback_data="set_mode:auto",
+                style="success" if mode == "auto" else None,
+            ),
+            InlineKeyboardButton(
+                "⚡ Ask Every Time",
+                callback_data="set_mode:ask",
+                style="success" if mode == "ask" else None,
+            ),
         ],
         [
-            InlineKeyboardButton(f"🎵 Always Audio{' ✅' if mode == 'always_audio' else ''}", callback_data="set_mode:always_audio"),
-            InlineKeyboardButton(f"🎬 Always Video{' ✅' if mode == 'always_video' else ''}", callback_data="set_mode:always_video"),
+            InlineKeyboardButton(
+                "🎵 Always Audio",
+                callback_data="set_mode:always_audio",
+                style="success" if mode == "always_audio" else None,
+            ),
+            InlineKeyboardButton(
+                "🎬 Always Video",
+                callback_data="set_mode:always_video",
+                style="success" if mode == "always_video" else None,
+            ),
         ],
-        # Section 2: Preferred Audio Quality
+        # Section 2: Preferred Audio Quality (Selected format turns solid green via style="success")
         [
-            InlineKeyboardButton(f"🎵 192k{' ✅' if aud == 'mp3_192' else ''}", callback_data="set_aud:mp3_192"),
-            InlineKeyboardButton(f"🎧 320k (HQ){' ✅' if aud == 'mp3_320' else ''}", callback_data="set_aud:mp3_320"),
-            InlineKeyboardButton(f"⚡ M4A{' ✅' if aud == 'm4a' else ''}", callback_data="set_aud:m4a"),
+            InlineKeyboardButton(
+                "🎵 192k",
+                callback_data="set_aud:mp3_192",
+                style="success" if aud == "mp3_192" else None,
+            ),
+            InlineKeyboardButton(
+                "🎧 320k (HQ)",
+                callback_data="set_aud:mp3_320",
+                style="success" if aud == "mp3_320" else None,
+            ),
+            InlineKeyboardButton(
+                "⚡ M4A",
+                callback_data="set_aud:m4a",
+                style="success" if aud == "m4a" else None,
+            ),
         ],
-        # Section 3: Preferred Video Quality
+        # Section 3: Preferred Video Quality (Selected resolution turns solid green via style="success")
         [
-            InlineKeyboardButton(f"🎬 480p{' ✅' if vid == 'mp4_480' else ''}", callback_data="set_vid:mp4_480"),
-            InlineKeyboardButton(f"🎬 720p (HD){' ✅' if vid in ('mp4_720', 'mp4') else ''}", callback_data="set_vid:mp4_720"),
-            InlineKeyboardButton(f"🎬 1080p (FHD){' ✅' if vid == 'mp4_1080' else ''}", callback_data="set_vid:mp4_1080"),
+            InlineKeyboardButton(
+                "🎬 480p",
+                callback_data="set_vid:mp4_480",
+                style="success" if vid == "mp4_480" else None,
+            ),
+            InlineKeyboardButton(
+                "🎬 720p (HD)",
+                callback_data="set_vid:mp4_720",
+                style="success" if vid in ("mp4_720", "mp4") else None,
+            ),
+            InlineKeyboardButton(
+                "🎬 1080p (FHD)",
+                callback_data="set_vid:mp4_1080",
+                style="success" if vid == "mp4_1080" else None,
+            ),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -196,12 +245,12 @@ def build_delivery_switch_keyboard(
     if current_format.startswith("mp4"):
         aud_label = "🎧 Extract MP3 (320k)" if default_audio == "mp3_320" else f"🎵 Extract Audio ({default_audio})"
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton(aud_label, callback_data=f"fmt:{default_audio}:{video_id}")]
+            [InlineKeyboardButton(aud_label, callback_data=f"fmt:{default_audio}:{video_id}", style="primary")]
         ])
     else:
         vid_label = "🎬 Get Video (720p HD)" if default_video == "mp4_720" else f"🎬 Get Video ({default_video.replace('mp4_', '')}p)"
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton(vid_label, callback_data=f"fmt:{default_video}:{video_id}")]
+            [InlineKeyboardButton(vid_label, callback_data=f"fmt:{default_video}:{video_id}", style="primary")]
         ])
 
 
@@ -220,7 +269,7 @@ def build_search_keyboard(results: List[Dict[str, Any]]) -> InlineKeyboardMarkup
 def build_cancel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     """Builds inline keyboard with a Cancel button for active playlists."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancel Playlist Download", callback_data=f"cancel_pl:{chat_id}")]
+        [InlineKeyboardButton("❌ Cancel Playlist Download", callback_data=f"cancel_pl:{chat_id}", style="danger")]
     ])
 
 
