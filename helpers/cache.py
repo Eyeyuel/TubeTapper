@@ -118,6 +118,21 @@ class AudioCacheManager:
                     )
                     # Clean up any video formats from legacy audio_cache table so it remains audio-only
                     conn.execute("DELETE FROM audio_cache WHERE video_id LIKE '%_mp4%'")
+
+                    # Purge contaminated video cache records where different formats share the same file_size
+                    conn.execute(
+                        """
+                        DELETE FROM media_cache 
+                        WHERE format_id IN ('mp4_480', 'mp4_720', 'mp4_1080')
+                          AND file_size > 0
+                          AND video_id IN (
+                              SELECT video_id FROM media_cache 
+                              WHERE format_id LIKE 'mp4_%' AND file_size > 0
+                              GROUP BY video_id, file_size 
+                              HAVING count(*) > 1
+                          )
+                        """
+                    )
                 except Exception as mig_exc:
                     logger.debug(f"Cache migration notice: {mig_exc}")
 
@@ -125,11 +140,61 @@ class AudioCacheManager:
         except Exception as exc:
             logger.warning(f"Failed to initialize SQLite fallback cache: {exc}")
 
+    async def purge_duplicate_video_cache(self) -> int:
+        """Purges contaminated video cache entries where different formats share the same file_size."""
+        deleted_count = 0
+        try:
+            with sqlite3.connect(self.sqlite_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT video_id, format_id FROM media_cache 
+                    WHERE format_id IN ('mp4_480', 'mp4_720', 'mp4_1080')
+                      AND file_size > 0
+                      AND video_id IN (
+                          SELECT video_id FROM media_cache 
+                          WHERE format_id LIKE 'mp4_%' AND file_size > 0
+                          GROUP BY video_id, file_size 
+                          HAVING count(*) > 1
+                      )
+                    """
+                )
+                dup_rows = cursor.fetchall()
+                if dup_rows:
+                    cursor.execute(
+                        """
+                        DELETE FROM media_cache 
+                        WHERE format_id IN ('mp4_480', 'mp4_720', 'mp4_1080')
+                          AND file_size > 0
+                          AND video_id IN (
+                              SELECT video_id FROM media_cache 
+                              WHERE format_id LIKE 'mp4_%' AND file_size > 0
+                              GROUP BY video_id, file_size 
+                              HAVING count(*) > 1
+                          )
+                        """
+                    )
+                    conn.commit()
+                    deleted_count = len(dup_rows)
+                    logger.info(f"Purged {deleted_count} duplicate contaminated video cache rows from SQLite.")
+
+                    if self._is_redis_active and self._redis_client:
+                        try:
+                            for vid, fmt in dup_rows:
+                                await self._redis_client.delete(f"media:{vid}:{fmt}")
+                                await self._redis_client.delete(f"audio:{vid}_{fmt}")
+                        except Exception as r_err:
+                            logger.debug(f"Error purging duplicate keys from Redis: {r_err}")
+        except Exception as exc:
+            logger.warning(f"Error in purge_duplicate_video_cache: {exc}")
+        return deleted_count
+
     async def initialize(self) -> None:
         """Attempts connection to Redis. Falls back to SQLite if unreachable."""
         if not REDIS_AVAILABLE or not self.redis_url:
             self._is_redis_active = False
             logger.info("Using SQLite fallback for audio caching (Redis not configured/installed).")
+            await self.purge_duplicate_video_cache()
             return
 
         try:
@@ -145,12 +210,14 @@ class AudioCacheManager:
             self._redis_client = client
             self._is_redis_active = True
             logger.info(f"Connected to Redis cache at {self.redis_url}")
+            await self.purge_duplicate_video_cache()
         except Exception as exc:
             self._is_redis_active = False
             self._redis_client = None
             logger.warning(
                 f"Could not connect to Redis ({exc}). Falling back to SQLite cache at {self.sqlite_path}."
             )
+            await self.purge_duplicate_video_cache()
 
     @property
     def is_redis_active(self) -> bool:

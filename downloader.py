@@ -1,7 +1,9 @@
 """Audio downloader and playlist processing module using yt-dlp and ffmpeg for the YouTube to Telegram Music Downloader Bot."""
 
 import asyncio
+import json
 import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlparse
@@ -99,7 +101,7 @@ class AudioDownloader:
             logger.debug(f"Error extracting video ID: {exc}")
         return None
 
-    def _apply_network_options(self, opts: Dict[str, Any]) -> Dict[str, Any]:
+    def _apply_network_options(self, opts: Dict[str, Any], is_video: bool = False) -> Dict[str, Any]:
         """Injects cookies file, rotating proxy settings, and anti-bot mobile player clients."""
         # 1. Automatic cookie discovery
         if self.config.youtube_cookies_file and Path(self.config.youtube_cookies_file).exists():
@@ -114,11 +116,14 @@ class AudioDownloader:
         if active_proxy:
             opts["proxy"] = str(active_proxy)
 
-        # 3. Bypass YouTube bot verification / 429 sign-in via mobile player clients
+        # 3. Bypass YouTube bot verification / 429 sign-in via adaptive player clients
         extractor_args = opts.setdefault("extractor_args", {})
         youtube_args = extractor_args.setdefault("youtube", {})
         if "player_client" not in youtube_args:
-            youtube_args["player_client"] = ["android", "ios"]
+            if is_video:
+                youtube_args["player_client"] = ["android", "web", "ios"]
+            else:
+                youtube_args["player_client"] = ["android", "ios"]
 
         return opts
 
@@ -176,32 +181,88 @@ class AudioDownloader:
 
         return results
 
+    @staticmethod
+    def fetch_youtube_oembed(url: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
+        """Fast fallback to retrieve basic video metadata via YouTube oEmbed API."""
+        try:
+            req = urllib.request.Request(
+                f"https://www.youtube.com/oembed?url={url}&format=json",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                if response.status == 200:
+                    return json.loads(response.read().decode("utf-8"))
+        except Exception as e:
+            logger.debug(f"oEmbed fetch skipped for {url}: {e}")
+        return None
+
     def get_video_info(self, url: str) -> Dict[str, Any]:
         """Extracts video metadata without downloading the media stream."""
+        vid_id = self.extract_video_id(url)
+        oembed_data = None
+        if vid_id:
+            # Sub-second title & artist retrieval via public unthrottled endpoint
+            oembed_data = self.fetch_youtube_oembed(url)
+
         ydl_opts = {
             "skip_download": True,
-            "extract_flat": False,
+            "extract_flat": True,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
         }
         ydl_opts = self._apply_network_options(ydl_opts)
+        extractor_args = ydl_opts.setdefault("extractor_args", {})
+        youtube_args = extractor_args.setdefault("youtube", {})
+        # Target single lightweight client for metadata to eliminate multi-client delay
+        youtube_args["player_client"] = ["android"]
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=False)
             except Exception as e:
-                logger.error(f"Failed to extract info for {url}: {e}")
+                logger.warning(f"Failed to extract info via yt-dlp for {url}: {e}")
+                if oembed_data:
+                    raw_title = oembed_data.get("title", "YouTube Video")
+                    raw_artist = oembed_data.get("author_name", "Unknown Artist")
+                    display_title, artist, song_name = parse_title_and_artist(raw_title, raw_artist)
+                    return {
+                        "id": vid_id or "",
+                        "title": display_title,
+                        "song_name": song_name,
+                        "artist": artist,
+                        "duration": 0,
+                        "thumbnail_url": oembed_data.get("thumbnail_url"),
+                        "webpage_url": url,
+                        "is_live": False,
+                        "filesize_approx": 0,
+                    }
                 raise
 
             if not info:
+                if oembed_data:
+                    raw_title = oembed_data.get("title", "YouTube Video")
+                    raw_artist = oembed_data.get("author_name", "Unknown Artist")
+                    display_title, artist, song_name = parse_title_and_artist(raw_title, raw_artist)
+                    return {
+                        "id": vid_id or "",
+                        "title": display_title,
+                        "song_name": song_name,
+                        "artist": artist,
+                        "duration": 0,
+                        "thumbnail_url": oembed_data.get("thumbnail_url"),
+                        "webpage_url": url,
+                        "is_live": False,
+                        "filesize_approx": 0,
+                    }
                 raise ValueError(f"No metadata returned for {url}")
 
-            raw_title = info.get("title", "Unknown Title")
+            raw_title = info.get("title") or (oembed_data.get("title") if oembed_data else "Unknown Title")
             raw_artist = (
                 info.get("artist")
                 or info.get("creator")
                 or info.get("uploader")
+                or (oembed_data.get("author_name") if oembed_data else None)
                 or "Unknown Artist"
             )
             display_title, artist, song_name = parse_title_and_artist(
@@ -209,13 +270,13 @@ class AudioDownloader:
             )
 
             duration = int(info.get("duration") or 0)
-            thumbnail_url = info.get("thumbnail")
+            thumbnail_url = info.get("thumbnail") or (oembed_data.get("thumbnail_url") if oembed_data else None)
             webpage_url = info.get("webpage_url", url)
             is_live = bool(info.get("is_live", False))
             filesize_approx = int(info.get("filesize_approx") or info.get("filesize") or 0)
 
             return {
-                "id": info.get("id", ""),
+                "id": info.get("id", vid_id or ""),
                 "title": display_title,
                 "song_name": song_name,
                 "artist": artist,
@@ -362,7 +423,7 @@ class AudioDownloader:
         elif chosen_format.startswith("mp4"):
             target_ext = "mp4"
             postprocessors = []
-            
+
             height_limit = 720  # default
             if "480" in chosen_format:
                 height_limit = 480
@@ -370,11 +431,15 @@ class AudioDownloader:
                 height_limit = 720
             elif "1080" in chosen_format:
                 height_limit = 1080
-                
+
+            # Dual-orientation resolution specification supporting 16:9 landscape and 9:16 vertical Shorts
+            w_limit = int(height_limit * 16 / 9) + 60
             format_spec = (
-                f"bestvideo[ext=mp4][height<={height_limit}]+bestaudio[ext=m4a]/"
-                f"bestvideo[height<={height_limit}]+bestaudio/"
-                f"best[ext=mp4][height<={height_limit}]/best[height<={height_limit}]/best"
+                f"bestvideo[ext=mp4][height<=?{height_limit}][width<=?{w_limit}]+bestaudio[ext=m4a]/"
+                f"bestvideo[ext=mp4][width<=?{height_limit}][height<=?{w_limit}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<=?{height_limit}][width<=?{w_limit}]+bestaudio/"
+                f"bestvideo[width<=?{height_limit}][height<=?{w_limit}]+bestaudio/"
+                f"best[height<=?{height_limit}]/best[width<=?{height_limit}]"
             )
         else:
             # Universal MP3 conversion at configured bitrate
@@ -400,7 +465,7 @@ class AudioDownloader:
             "no_warnings": True,
             "noplaylist": True,
         }
-        ydl_opts = self._apply_network_options(ydl_opts)
+        ydl_opts = self._apply_network_options(ydl_opts, is_video=(target_ext == "mp4"))
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:

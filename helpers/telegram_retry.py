@@ -73,6 +73,9 @@ async def send_with_retry(
                 f"Retrying attempt {attempt + 1}/{max_retries} in {delay:.1f}s..."
             )
             await asyncio.sleep(delay)
+        except telegram.error.BadRequest:
+            # Client errors (invalid parameters, parse errors, etc.) should not be retried
+            raise
         except (telegram.error.TimedOut, telegram.error.NetworkError) as exc:
             last_exc = exc
             if attempt >= max_retries:

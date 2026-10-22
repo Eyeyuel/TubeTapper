@@ -6,11 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DOWNLOAD_DIR=/app/downloads
 
-# Install FFmpeg and required system libraries
+# Install FFmpeg, Node.js runtime for yt-dlp challenge solving, and required system libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
     curl \
+    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory

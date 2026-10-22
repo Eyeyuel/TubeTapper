@@ -30,6 +30,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+import httpx
+from telegram.helpers import escape_markdown
 from telegram.request import HTTPXRequest
 
 from config import config
@@ -41,6 +43,7 @@ from helpers.progress import (
     render_progress_bar,
     repost_status_message,
     safe_delete_message,
+    update_or_reply_status,
     update_status_message,
 )
 from helpers.queue_manager import queue_manager
@@ -505,25 +508,52 @@ async def handle_single_track(
         audio_format = requested_format
     else:
         if mode == "ask":
-            try:
-                info = await asyncio.to_thread(downloader.get_video_info, url)
-                title = info.get("title", "YouTube Video")
-                duration = int(info.get("duration") or 0)
-                dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else "Unknown"
-            except Exception:
-                title = "YouTube Video"
-                dur_str = "Unknown"
+            title = "YouTube Video"
+            dur_str = "Unknown"
+            cached_data = None
+            if video_id:
+                try:
+                    cached_data = await cache_manager.get(video_id, "mp3_320")
+                    if not cached_data:
+                        cached_data = await cache_manager.get(video_id, "mp4_720")
+                except Exception:
+                    pass
 
+            if cached_data and cached_data.get("title"):
+                title = cached_data["title"]
+                duration = int(cached_data.get("duration") or 0)
+                dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else "Unknown"
+            else:
+                try:
+                    info = await asyncio.wait_for(
+                        asyncio.to_thread(downloader.get_video_info, url),
+                        timeout=12.0,
+                    )
+                    title = info.get("title", "YouTube Video")
+                    duration = int(info.get("duration") or 0)
+                    dur_str = f"{duration // 60}:{duration % 60:02d}" if duration else "Unknown"
+                except Exception as exc:
+                    logger.debug(f"Fast video info extraction skipped/timed out: {exc}")
+                    oembed = downloader.fetch_youtube_oembed(url) if hasattr(downloader, "fetch_youtube_oembed") else None
+                    if isinstance(oembed, dict) and oembed.get("title"):
+                        title = str(oembed["title"])
+                    else:
+                        title = "YouTube Video"
+                    dur_str = "Unknown"
+
+            safe_title = escape_markdown(title, version=1)
             text = (
-                f"🎬 *{title}*\n"
+                f"🎬 *{safe_title}*\n"
                 f"⏱ Duration: `{dur_str}`\n\n"
                 f"*Choose your download format:*"
             )
             media_id = video_id or url
-            await update_status_message(
+            await update_or_reply_status(
                 status_msg,
                 text,
                 reply_markup=build_format_picker_keyboard(media_id, is_playlist=False),
+                chat_id=chat_id,
+                bot=context.bot,
             )
             return
         elif mode == "always_audio":
@@ -544,9 +574,6 @@ async def handle_single_track(
 
     metrics.increment("downloads_total")
 
-    # Quick format switch markup attached to delivery
-    switch_kb = build_delivery_switch_keyboard(video_id, audio_format, default_audio_fmt, default_vid_fmt)
-
     # 1. Instant Cache Check (Telegram file_id reuse)
     if video_id:
         try:
@@ -562,8 +589,6 @@ async def handle_single_track(
                     "duration": cached.get("duration"),
                     "reply_to_message_id": reply_to,
                 }
-                if switch_kb:
-                    kwargs["reply_markup"] = switch_kb
 
                 if is_video:
                     kwargs["video"] = cached["file_id"]
@@ -597,8 +622,6 @@ async def handle_single_track(
                         "duration": cached.get("duration"),
                         "reply_to_message_id": reply_to,
                     }
-                    if switch_kb:
-                        kwargs["reply_markup"] = switch_kb
 
                     if is_video:
                         kwargs["video"] = cached["file_id"]
@@ -704,8 +727,6 @@ async def handle_single_track(
                             "duration": track_data.get("duration"),
                             "reply_to_message_id": reply_to,
                         }
-                        if switch_kb:
-                            kwargs["reply_markup"] = switch_kb
 
                         if is_video:
                             kwargs["video"] = audio_file
@@ -1231,8 +1252,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     url = match.group(1)
-    status_msg = await update.effective_message.reply_text(
-        "🔎 *Analyzing YouTube link...*", parse_mode="Markdown"
+    status_msg = await send_with_retry(
+        update.effective_message.reply_text,
+        "🔎 *Analyzing YouTube link...*",
+        parse_mode="Markdown",
     )
 
     downloader = AudioDownloader()
@@ -1339,6 +1362,16 @@ def create_bot_app(token: Optional[str] = None) -> Application:
     if not bot_token or bot_token == "your_telegram_bot_token_here":
         bot_token = "TEST_TOKEN_FOR_INITIALIZATION"
 
+    limits = httpx.Limits(
+        max_connections=256,
+        max_keepalive_connections=20,
+        keepalive_expiry=20.0,
+    )
+    get_updates_limits = httpx.Limits(
+        max_connections=64,
+        max_keepalive_connections=10,
+        keepalive_expiry=20.0,
+    )
     request = HTTPXRequest(
         connection_pool_size=256,
         connect_timeout=20.0,
@@ -1346,6 +1379,7 @@ def create_bot_app(token: Optional[str] = None) -> Application:
         write_timeout=120.0,
         media_write_timeout=300.0,
         pool_timeout=15.0,
+        httpx_kwargs={"limits": limits},
     )
     get_updates_request = HTTPXRequest(
         connection_pool_size=64,
@@ -1353,6 +1387,7 @@ def create_bot_app(token: Optional[str] = None) -> Application:
         read_timeout=60.0,
         write_timeout=60.0,
         pool_timeout=15.0,
+        httpx_kwargs={"limits": get_updates_limits},
     )
 
     builder = (

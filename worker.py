@@ -63,13 +63,6 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
                 "duration": cached.get("duration"),
                 "reply_to_message_id": reply_to,
             }
-            try:
-                from bot import build_delivery_switch_keyboard
-                switch_kb = build_delivery_switch_keyboard(video_id, audio_format)
-                if switch_kb:
-                    kwargs["reply_markup"] = switch_kb
-            except Exception:
-                pass
 
             if is_video:
                 kwargs["video"] = cached["file_id"]
@@ -148,13 +141,6 @@ async def process_download_job(ctx: Dict[str, Any], job_data: Dict[str, Any]) ->
                     "duration": track_data.get("duration"),
                     "reply_to_message_id": reply_to,
                 }
-                try:
-                    from bot import build_delivery_switch_keyboard
-                    switch_kb = build_delivery_switch_keyboard(video_id, audio_format)
-                    if switch_kb:
-                        kwargs["reply_markup"] = switch_kb
-                except Exception:
-                    pass
 
                 if is_video:
                     kwargs["video"] = audio_file
