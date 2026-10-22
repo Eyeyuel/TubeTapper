@@ -20,7 +20,17 @@ logger = setup_logger("worker")
 
 def get_worker_bot() -> telegram.Bot:
     """Instantiates a Telegram Bot client configured with local server and local mode if enabled."""
-    kwargs = {}
+    from telegram.request import HTTPXRequest
+
+    request = HTTPXRequest(
+        connection_pool_size=128,
+        connect_timeout=20.0,
+        read_timeout=60.0,
+        write_timeout=120.0,
+        media_write_timeout=300.0,
+        pool_timeout=15.0,
+    )
+    kwargs = {"request": request}
     if config.telegram_api_server_url:
         kwargs["base_url"] = config.telegram_api_server_url
     if config.telegram_local_mode:

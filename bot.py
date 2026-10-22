@@ -30,6 +30,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from config import config
 from downloader import AudioDownloader, format_download_error
@@ -1062,6 +1063,21 @@ async def handle_playlist(
     )
 
 
+async def safe_query_answer(
+    query: Any,
+    text: Optional[str] = None,
+    show_alert: bool = False,
+    **kwargs: Any,
+) -> None:
+    """Answers a callback query safely without letting network/connect timeouts abort execution."""
+    if not query:
+        return
+    try:
+        await query.answer(text=text, show_alert=show_alert, **kwargs)
+    except Exception as exc:
+        logger.debug(f"Non-critical callback query answer notice: {exc}")
+
+
 @restricted
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Routes callback queries for search results, format settings, and playlist cancellation."""
@@ -1072,7 +1088,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
 
     if data.startswith("dl:"):
-        await query.answer()
+        await safe_query_answer(query)
         video_id = data.split("dl:", 1)[1]
         url = f"https://www.youtube.com/watch?v={video_id}"
         status_msg = await query.message.reply_text(
@@ -1090,7 +1106,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             url = f"https://www.youtube.com/watch?v={video_id}" if not video_id.startswith("http") else video_id
             fmt_clean = chosen_fmt.replace("mp4_", "").replace("mp3_", "").upper()
             media_kind = "Video" if chosen_fmt.startswith("mp4") else "Audio"
-            await query.answer(f"Preparing {media_kind} ({fmt_clean})...")
+            await safe_query_answer(query, f"Preparing {media_kind} ({fmt_clean})...")
             status_msg = await query.message.reply_text(
                 f"🔎 *Preparing {media_kind} ({fmt_clean})...*", parse_mode="Markdown"
             )
@@ -1106,7 +1122,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             url = PENDING_PLAYLIST_URLS.get(pl_key) or f"https://www.youtube.com/playlist?list={pl_key}"
             fmt_clean = chosen_fmt.replace("mp4_", "").replace("mp3_", "").upper()
             media_kind = "Video" if chosen_fmt.startswith("mp4") else "Audio"
-            await query.answer(f"Preparing {media_kind} ({fmt_clean}) playlist...")
+            await safe_query_answer(query, f"Preparing {media_kind} ({fmt_clean}) playlist...")
             status_msg = await query.message.reply_text(
                 f"🔎 *Preparing {media_kind} ({fmt_clean}) playlist download...*", parse_mode="Markdown"
             )
@@ -1118,10 +1134,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         event = ACTIVE_PLAYLIST_CANCELLATIONS.get(target_chat_id)
         if event:
             event.set()
-            await query.answer("Playlist download cancellation requested!", show_alert=True)
+            await safe_query_answer(query, "Playlist download cancellation requested!", show_alert=True)
             logger.info(f"Cancellation requested for chat_id={target_chat_id}")
         else:
-            await query.answer("No active playlist download found to cancel.", show_alert=True)
+            await safe_query_answer(query, "No active playlist download found to cancel.", show_alert=True)
 
     elif data.startswith("set_mode:"):
         chosen_mode = data.split("set_mode:", 1)[1]
@@ -1140,7 +1156,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
         except Exception:
             pass
-        await query.answer(f"Mode updated: {mode_titles.get(chosen_mode, chosen_mode)}!")
+        await safe_query_answer(query, f"Mode updated: {mode_titles.get(chosen_mode, chosen_mode)}!")
 
     elif data.startswith("set_aud:"):
         chosen_aud = data.split("set_aud:", 1)[1]
@@ -1153,7 +1169,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
         except Exception:
             pass
-        await query.answer(f"Audio quality updated to {chosen_aud.replace('mp3_', '')} kbps!")
+        await safe_query_answer(query, f"Audio quality updated to {chosen_aud.replace('mp3_', '')} kbps!")
 
     elif data.startswith("set_vid:"):
         chosen_vid = data.split("set_vid:", 1)[1]
@@ -1166,7 +1182,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
         except Exception:
             pass
-        await query.answer(f"Video quality updated to {chosen_vid.replace('mp4_', '')}p!")
+        await safe_query_answer(query, f"Video quality updated to {chosen_vid.replace('mp4_', '')}p!")
 
     elif data.startswith("set_fmt:"):
         chosen_fmt = data.split("set_fmt:", 1)[1]
@@ -1182,14 +1198,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
         except Exception:
             pass
-        await query.answer("Setting updated!")
+        await safe_query_answer(query, "Setting updated!")
 
     elif data == "cmd_settings":
-        await query.answer()
+        await safe_query_answer(query)
         await settings_command(update, context)
 
     elif data == "cmd_help":
-        await query.answer()
+        await safe_query_answer(query)
         await help_command(update, context)
 
 
@@ -1323,9 +1339,27 @@ def create_bot_app(token: Optional[str] = None) -> Application:
     if not bot_token or bot_token == "your_telegram_bot_token_here":
         bot_token = "TEST_TOKEN_FOR_INITIALIZATION"
 
+    request = HTTPXRequest(
+        connection_pool_size=256,
+        connect_timeout=20.0,
+        read_timeout=60.0,
+        write_timeout=120.0,
+        media_write_timeout=300.0,
+        pool_timeout=15.0,
+    )
+    get_updates_request = HTTPXRequest(
+        connection_pool_size=64,
+        connect_timeout=20.0,
+        read_timeout=60.0,
+        write_timeout=60.0,
+        pool_timeout=15.0,
+    )
+
     builder = (
         ApplicationBuilder()
         .token(bot_token)
+        .request(request)
+        .get_updates_request(get_updates_request)
         .concurrent_updates(True)
         .post_init(on_startup)
         .post_shutdown(on_shutdown)
