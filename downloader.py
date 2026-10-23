@@ -125,6 +125,10 @@ class AudioDownloader:
             else:
                 youtube_args["player_client"] = ["android", "ios"]
 
+        # 4. Explicitly register Node.js runtime for challenge solving & CDN handshakes
+        if "js_runtimes" not in opts:
+            opts["js_runtimes"] = {"node": {}}
+
         return opts
 
     def search_youtube(self, query: str, max_results: int = 5) -> List[Dict[str, Any]]:
@@ -461,6 +465,14 @@ class AudioDownloader:
             "writethumbnail": True,
             "concurrent_fragment_downloads": 2,
             "buffersize": 1024 * 64,
+            "retries": 10,
+            "fragment_retries": 10,
+            "file_access_retries": 3,
+            "extractor_retries": 5,
+            "retry_sleep_functions": {
+                "http": lambda n: min(2 ** n, 10),
+                "fragment": lambda n: min(2 ** n, 10),
+            },
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
@@ -729,14 +741,105 @@ class AudioDownloader:
                 logger.warning(f"Failed to remove file {p}: {e}")
 
 
-def format_download_error(exc: Exception) -> str:
-    """Formats raw yt-dlp / ffmpeg exceptions into user-friendly Telegram markdown."""
-    err_str = str(exc)
-    if "confirm you’re not a bot" in err_str or "Sign in to confirm" in err_str:
-        return "❌ *Download blocked by YouTube.*\nYouTube is requiring bot verification for this track. Please try another link or configure cookies."
-    if "Private video" in err_str:
-        return "❌ *Download failed:*\nThis video is private on YouTube."
-    if "Join this channel" in err_str or "members-only" in err_str.lower():
-        return "❌ *Download failed:*\nThis video requires channel membership."
-    return f"❌ *Download failed:*\n`{err_str[:150]}`"
+def format_download_error(exc: Union[Exception, str]) -> str:
+    """Formats raw yt-dlp, ffmpeg, or network exceptions into user-friendly Telegram markdown."""
+    err = str(exc).lower()
+
+    # 1. Age-Restricted Content (Check before general sign-in checks)
+    if any(k in err for k in ["confirm your age", "age-restricted", "inappropriate for some users"]):
+        return (
+            "🔞 *Age-Restricted Track*\n\n"
+            "This track is age-restricted on YouTube and requires account authentication to download."
+        )
+
+    # 2. Bot Verification & Captcha
+    if any(k in err for k in ["confirm you’re not a bot", "confirm you're not a bot", "not a bot", "bot verification"]):
+        return (
+            "🛡 *Download Blocked by YouTube*\n\n"
+            "YouTube is temporarily requesting bot verification for this track.\n"
+            "💡 *Tip:* Please try another link or select a different format."
+        )
+
+    # 3. Server Errors (HTTP 500, 502, 503, 504)
+    if any(k in err for k in ["http error 500", "http error 502", "http error 503", "http error 504", "internal server error", "service unavailable"]):
+        return (
+            "⚠️ *YouTube Server Issue*\n\n"
+            "YouTube's media servers returned a temporary server error (HTTP 500).\n"
+            "💡 *Tip:* Please try downloading this track again in a moment."
+        )
+
+    # 4. Connection & Network Timeouts
+    if any(k in err for k in ["network is unreachable", "errno 101", "connection reset", "remotedisconnected", "timed out", "timeouterror", "name resolution"]):
+        return (
+            "📡 *Connection Timeout*\n\n"
+            "Lost connection to media servers during download.\n"
+            "💡 *Tip:* Please check back and try again shortly."
+        )
+
+    # 5. Private or Deleted Content
+    if any(k in err for k in ["private video", "this video has been removed", "video unavailable", "deleted by the uploader"]):
+        return (
+            "🔒 *Video Unavailable*\n\n"
+            "This video is private, removed, or no longer accessible on YouTube."
+        )
+
+    # 6. Members-Only / Paid Content
+    if any(k in err for k in ["join this channel", "members-only", "payment required"]):
+        return (
+            "👑 *Members-Only Content*\n\n"
+            "This track requires a YouTube channel membership to access."
+        )
+
+    # 7. Copyright & Region Restrictions
+    if any(k in err for k in ["not available in your country", "available in your country", "copyright grounds", "contains content from", "who has blocked it", "blocked in your country"]):
+        return (
+            "🌍 *Region Restricted*\n\n"
+            "This video is blocked in our server's region due to copyright or geographic licensing."
+        )
+
+    # 8. Format Unavailable
+    if any(k in err for k in ["requested format is not available", "no video formats found"]):
+        return (
+            "🎬 *Format Unavailable*\n\n"
+            "The requested quality format is not available for this track.\n"
+            "💡 *Tip:* Try downloading in MP3 audio or 480p video."
+        )
+
+    # 9. File Size Limit
+    if any(k in err for k in ["exceeds limit", "exceeds_limit", "file too large"]):
+        return (
+            "⚠️ *File Too Large*\n\n"
+            "The file exceeds Telegram's upload limits.\n"
+            "💡 *Tip:* Try downloading in MP3 or 480p for a smaller file size."
+        )
+
+    # 10. Polished Generic Fallback (NO raw terminal text)
+    return (
+        "❌ *Download Failed*\n\n"
+        "An unexpected error occurred while processing this track.\n"
+        "💡 *Tip:* Please try again in a moment or try another search result."
+    )
+
+
+def get_short_error_reason(exc: Union[Exception, str]) -> str:
+    """Returns a concise 2-4 word reason for playlist skip progress bars."""
+    err = str(exc).lower()
+    if any(k in err for k in ["500", "502", "503", "504", "server error"]):
+        return "YouTube server error"
+    if any(k in err for k in ["unreachable", "errno 101", "timed out", "reset"]):
+        return "Connection timeout"
+    if any(k in err for k in ["age-restricted", "confirm your age"]):
+        return "Age-restricted"
+    if any(k in err for k in ["private", "removed", "unavailable"]):
+        return "Video unavailable"
+    if any(k in err for k in ["members-only", "join this channel"]):
+        return "Members-only"
+    if any(k in err for k in ["copyright", "country"]):
+        return "Region-blocked"
+    if any(k in err for k in ["format is not available"]):
+        return "Format unavailable"
+    if any(k in err for k in ["confirm you’re not a bot", "confirm you're not a bot", "bot verification"]):
+        return "Bot verification required"
+    return "Download error"
+
 

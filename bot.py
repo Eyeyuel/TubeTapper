@@ -35,7 +35,7 @@ from telegram.helpers import escape_markdown
 from telegram.request import HTTPXRequest
 
 from config import config
-from downloader import AudioDownloader, format_download_error
+from downloader import AudioDownloader, format_download_error, get_short_error_reason
 from helpers.cache import cache_manager
 from helpers.cleanup import cleanup_orphaned_downloads
 from helpers.logger import setup_logger
@@ -911,11 +911,12 @@ async def handle_playlist(
             if error:
                 skipped_count += 1
                 logger.warning(f"Skipping track {index}/{total_tracks}: {error}")
+                clean_reason = get_short_error_reason(error)
                 await update_status_message(
                     status_msg,
                     f"📋 *Playlist:* {title}\n"
                     f"⏳ Progress: {progress_bar} `[{index}/{total_tracks}]`\n"
-                    f"⚠️ *Skipped track {index}:* `{error[:60]}`",
+                    f"⚠️ *Skipped track {index}:* {clean_reason}",
                     reply_markup=cancel_kb,
                 )
                 continue
